@@ -15,14 +15,10 @@ foreach ($v in "VICTORY_KEYS", "VICTORY_CAPTURE", "VICTORY_CAPTURE_FRAMES", "VIC
 New-Item -ItemType Directory -Force $Cache, $Data | Out-Null
 $env:VICTORY_CACHE_DIR = $Cache
 $env:VICTORY_DATA_DIR = $Data
-# Performance pipeline (fxceless 0b0074e: 7-12 fps)
+# Performance pipeline (fxceless 0b0074e fast path, without off-by-default tile/queue2/tail MMU-fault hazards)
 $env:VICTORY_ASYNC_SUBMIT = "1"
 $env:VICTORY_REFRESH_ONCE = "1"
-$env:VICTORY_QUEUE2 = "1"
-$env:VICTORY_QUEUE2_LANDING_MB = "128"
 $env:VICTORY_COPY_PLAIN = "1"
-$env:VICTORY_TEXTURE_NO_WAIT = "1"
-$env:VICTORY_LEVELS_ON_DEMAND = "1"
 $env:VICTORY_CARD_BUFFERS_MIN_MB = "1"
 $env:VICTORY_CARD_BUFFERS_MB = "1024"
 $env:VICTORY_MERGE_GAP = "64"
@@ -36,8 +32,7 @@ $env:VICTORY_PIPELINE_WAIT_MS = "24"
 # Graphics & stability (Belobug ambient/quads + DexNom shader/PSO fixes + 8 GB GPU TDR/VRAM headroom)
 $env:VICTORY_AMBIENT = "0.6"
 $env:VICTORY_MAX_FPS = "30"
-$env:VICTORY_WINDOW_KB = "256"
-$env:VICTORY_WINDOW_TAILS = "1"
+$env:VICTORY_INDIRECT_WINDOW = "0"
 $env:VICTORY_LATE_WAIT_LISTS = "128"
 $env:VICTORY_TEXTURE_BUDGET_MB = "1792"
 $env:RUST_BACKTRACE = "1"

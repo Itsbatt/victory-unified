@@ -170,6 +170,21 @@ fn mirror(handle: u64) {
     }
 }
 
+/// Flushes deferred descriptor unmakings and levels-on-demand view remakes on
+/// every live shader-visible view heap once no GPU submission is executing.
+#[cfg(windows)]
+pub(crate) fn flush_idle_heaps() {
+    let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
+    for &(_, _, at) in heaps.iter() {
+        // SAFETY: registered heaps are live (removed when dropped).
+        let heap = unsafe { &*(at as *const Heap) };
+        if let Some(Some(host)) = heap.host.get() {
+            host.flush_unmake();
+            host.texture_views_remade();
+        }
+    }
+}
+
 /// Mirrors records copied directly into placed shader-visible heaps. Calls
 /// to `Create*View` are already mirrored by [`mirror`]; raw CPU copies leave
 /// only write-watch pages to reveal which slots changed.
