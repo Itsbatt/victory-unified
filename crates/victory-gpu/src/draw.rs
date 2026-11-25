@@ -190,9 +190,21 @@ fn windows() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_INDIRECT_WINDOW").is_some_and(|v| v == "1")) && !crate::drvwatch::tripped()
 }
 
+/// Where the clamps of a run of indirect draws go: the list `clamps`, open,
+/// that runs before the host list at `into`, as long as that one has `writes`
+/// dispatches and copies (a later one may write the arguments).
+pub(crate) struct Hoist {
+    pub(crate) clamps: std::sync::Arc<HostList>,
+    pub(crate) into: usize,
+    pub(crate) writes: u64,
+}
+
 /// What one title list has set, and what its host list was last given.
 #[derive(Default)]
 pub(crate) struct State {
+    /// The list before the host list recorded into that holds the clamps of its
+    /// indirect draws (`crate::indirect::hoisting`), still open.
+    hoist: Option<Hoist>,
     pipeline: usize,
     /// View heap, sampler heap.
     heaps: [usize; 2],
@@ -589,6 +601,32 @@ impl State {
 
     pub(crate) fn set_index_buffer(&mut self, view: Option<&IndexView>) {
         self.index = view.copied().unwrap_or_default();
+    }
+
+    /// Whether the clamps of indirect draws recorded in `list` now go to the
+    /// list before it.
+    pub(crate) fn hoists_into(&self, list: &HostList) -> bool {
+        self.hoist
+            .as_ref()
+            .is_some_and(|h| h.into == std::ptr::from_ref(list) as usize && h.writes == list.writes())
+    }
+
+    /// From here on the clamps of `into`'s indirect draws go to `clamps`.
+    pub(crate) fn hoist(&mut self, clamps: std::sync::Arc<HostList>, into: &HostList) {
+        self.end_hoist();
+        self.hoist = Some(Hoist {
+            clamps,
+            into: std::ptr::from_ref(into) as usize,
+            writes: into.writes(),
+        });
+    }
+
+    /// Ends and closes the list of hoisted clamps, if any.
+    pub(crate) fn end_hoist(&mut self) {
+        if let Some(h) = self.hoist.take() {
+            h.clamps.clamp_end();
+            h.clamps.close();
+        }
     }
 
     /// Render targets and depth, set on the host list at once.
@@ -2090,6 +2128,7 @@ impl State {
         list.note_op(|| self.op_text(format!("dispatch {x}x{y}x{z}"), true));
         // SAFETY: an open list with everything set.
         unsafe { list.list.Dispatch(x, y, z) };
+        list.count_write();
         DISPATCHED.fetch_add(1, Ordering::Relaxed);
         if self.ambient(list, p) {
             self.host_heaps = [0; 2];
@@ -3000,101 +3039,140 @@ impl State {
             why("mesh draws are switched off (VICTORY_MESH_TEST=skip)");
             return false;
         }
-        // A window of records clamped in one pass (`windows`): for single
-        // records without a count buffer, drawn by shaders that store to no
-        // buffer. Anything else ends the window: it uses the scratch buffer
-        // or may write the arguments.
-        const WINDOW_USE: usize = usize::MAX - 0x77;
-        let offset = args.offset(arguments);
-        let windowed = windows()
-            && kind != DISPATCH
-            && max == 1
-            && count.is_none()
-            && !p.stages.iter().any(|stage| stage.translated().stores);
-        // Another host list (a new one after a cut, or this one after its
-        // reset) has another scratch buffer, or this one's with old bytes.
-        if !windowed || list.first_use(WINDOW_USE) {
-            self.window = None;
-        }
-        let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
-        let hit = self
-            .window
-            .as_ref()
-            .filter(|w| same(w) && offset >= w.base)
-            .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
-            .map(|w| (w.scratch.clone(), offset - w.base, w.step));
-        let (bounded, at) = match hit {
-            Some((scratch, at, step)) => {
-                // Diagnostics of windows: the record clamped again and
-                // compared (`crate::indirect::window_check`).
-                if crate::indirect::window_check()
-                    && crate::indirect::check_hit(
-                        list,
-                        (&args.buffer, offset),
-                        (kind, step),
-                        &scratch,
-                        at,
-                    )
-                {
-                    self.host_pipeline = 0;
-                    self.host_roots[1] = 0;
-                }
-                (scratch, at)
+        // Draws of a run: clamped in the list before (`crate::list::hoist`) so
+        // no compute PSO/barrier interrupts a batch of indirect draws.
+        let before = (kind != DISPATCH
+            && match crate::indirect::hoist_mode() {
+                0 | 6 => false,
+                3 => kind == MESH,
+                4 => kind != MESH,
+                _ => true,
+            }
+            && !(matches!(kind, DRAW | INDEXED) && self.topology == RECTANGLES)
+            && !windows()
+            && self.hoists_into(list))
+        .then(|| self.hoist.as_ref().map(|h| h.clamps.clone()))
+        .flatten()
+        .and_then(|clamps| {
+            let offset = args.offset(arguments);
+            args.refresh(&clamps, arguments, len);
+            if let Some((s, at)) = &counter {
+                s.refresh(&clamps, *at, 4);
+            }
+            let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+            #[cfg(feature = "diagnostics")]
+            clamps.note_op(|| format!("hoisted clamp of kind {kind}"));
+            crate::indirect::bound_before(
+                &clamps,
+                (&args.buffer, offset),
+                count_arg,
+                (kind, stride, max),
+            )
+        });
+        let inline = before.is_none();
+        let (bounded, at) = match before {
+            Some(b) => {
+                self.window = None;
+                b
             }
             None => {
-                // A record a short step after the last window's last one
-                // (the same step as that window's, if it had one): the
-                // title walks the buffer, so the ones that step apart
-                // after it are clamped with it.
-                let (step, records) = match &self.window {
-                    Some(w) if windowed && same(w) => {
-                        let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
-                        let step = offset.saturating_sub(last);
-                        let walks = step >= u64::from(stride)
-                            && step <= 256
-                            && step % 4 == 0
-                            && (w.records == 1 || step == u64::from(w.step));
-                        if walks {
-                            let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
-                            (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
-                        } else {
-                            (stride, max)
-                        }
-                    }
-                    _ => (stride, max),
-                };
-                args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
-                if let Some((s, at)) = &counter {
-                    s.refresh(list, *at, 4);
-                }
-                // Bounded first: the clamp binds a compute pipeline of its
-                // own and copies clamped active records into a scratch
-                // buffer at offset 0.
-                let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
-                // More than the record asked for: a window clamped ahead,
-                // whose unfilled slots must not spend the list's budget.
-                let bounded = if windowed && records > 1 {
-                    crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
-                } else {
-                    crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
-                };
-                let Some(bounded) = bounded else {
+                // A window of records clamped in one pass (`windows`): for single
+                // records without a count buffer, drawn by shaders that store to no
+                // buffer. Anything else ends the window: it uses the scratch buffer
+                // or may write the arguments.
+                const WINDOW_USE: usize = usize::MAX - 0x77;
+                let offset = args.offset(arguments);
+                let windowed = windows()
+                    && kind != DISPATCH
+                    && max == 1
+                    && count.is_none()
+                    && !p.stages.iter().any(|stage| stage.translated().stores);
+                // Another host list (a new one after a cut, or this one after its
+                // reset) has another scratch buffer, or this one's with old bytes.
+                if !windowed || list.first_use(WINDOW_USE) {
                     self.window = None;
-                    why("not bounded (no clamp, or arguments not 4-byte aligned)");
-                    return false;
-                };
-                self.host_pipeline = 0;
-                self.host_roots[1] = 0;
-                self.window = windowed.then(|| Window {
-                    copy: args.id(),
-                    kind,
-                    stride,
-                    step,
-                    base: offset,
-                    records,
-                    scratch: bounded.clone(),
-                });
-                (bounded, 0)
+                }
+                let same = |w: &Window| w.copy == args.id() && w.kind == kind && w.stride == stride;
+                let hit = self
+                    .window
+                    .as_ref()
+                    .filter(|w| same(w) && offset >= w.base)
+                    .filter(|w| (offset - w.base) % u64::from(w.step) == 0 && (offset - w.base) / u64::from(w.step) < u64::from(w.records))
+                    .map(|w| (w.scratch.clone(), offset - w.base, w.step));
+                match hit {
+                    Some((scratch, at, step)) => {
+                        // Diagnostics of windows: the record clamped again and
+                        // compared (`crate::indirect::window_check`).
+                        if crate::indirect::window_check()
+                            && crate::indirect::check_hit(
+                                list,
+                                (&args.buffer, offset),
+                                (kind, step),
+                                &scratch,
+                                at,
+                            )
+                        {
+                            self.host_pipeline = 0;
+                            self.host_roots[1] = 0;
+                        }
+                        (scratch, at)
+                    }
+                    None => {
+                        // A record a short step after the last window's last one
+                        // (the same step as that window's, if it had one): the
+                        // title walks the buffer, so the ones that step apart
+                        // after it are clamped with it.
+                        let (step, records) = match &self.window {
+                            Some(w) if windowed && same(w) => {
+                                let last = w.base + u64::from(w.records - 1) * u64::from(w.step);
+                                let step = offset.saturating_sub(last);
+                                let walks = step >= u64::from(stride)
+                                    && step <= 256
+                                    && step % 4 == 0
+                                    && (w.records == 1 || step == u64::from(w.step));
+                                if walks {
+                                    let fit = (args.left(arguments) / step).min(WINDOW_MOST) as u32;
+                                    (step as u32, (if w.records == 1 { 16 } else { w.records * 2 }).min(fit).max(1))
+                                } else {
+                                    (stride, max)
+                                }
+                            }
+                            _ => (stride, max),
+                        };
+                        args.refresh(list, arguments, len.max(u64::from(step) * u64::from(records)));
+                        if let Some((s, at)) = &counter {
+                            s.refresh(list, *at, 4);
+                        }
+                        // Bounded first: the clamp binds a compute pipeline of its
+                        // own and copies clamped active records into a scratch
+                        // buffer at offset 0.
+                        let count_arg = counter.as_ref().map(|(s, at)| (&s.buffer, s.offset(*at)));
+                        // More than the record asked for: a window clamped ahead,
+                        // whose unfilled slots must not spend the list's budget.
+                        let bounded = if windowed && records > 1 {
+                            crate::indirect::bound_ahead(list, (&args.buffer, offset), (kind, step, records))
+                        } else {
+                            crate::indirect::bound(list, (&args.buffer, offset), count_arg, (kind, step, records))
+                        };
+                        let Some(bounded) = bounded else {
+                            self.window = None;
+                            why("not bounded (no clamp, or arguments not 4-byte aligned)");
+                            return false;
+                        };
+                        self.host_pipeline = 0;
+                        self.host_roots[1] = 0;
+                        self.window = windowed.then(|| Window {
+                            copy: args.id(),
+                            kind,
+                            stride,
+                            step,
+                            base: offset,
+                            records,
+                            scratch: bounded.clone(),
+                        });
+                        (bounded, 0)
+                    }
+                }
             }
         };
         let ran = match kind {
@@ -3113,6 +3191,14 @@ impl State {
         });
         if kind == MESH {
             self.mesh_scissor(list, true);
+        }
+        if !inline && crate::indirect::hoist_mode() == 2 {
+            let barrier = D3D12_RESOURCE_BARRIER {
+                Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+                ..Default::default()
+            };
+            // SAFETY: an open list; the barrier names no resource.
+            unsafe { list.list.ResourceBarrier(&[barrier]) };
         }
         // SAFETY: an open list with everything set; the scratch buffer and
         // host copies are kept alive by the list, and the signature is cached.
@@ -3133,6 +3219,7 @@ impl State {
         // the window reads it with no barrier, and the next clamp moves it
         // back (`crate::indirect`).
         if kind == DISPATCH {
+            list.count_write();
             DISPATCHED.fetch_add(1, Ordering::Relaxed);
         } else {
             DRAWN.fetch_add(1, Ordering::Relaxed);

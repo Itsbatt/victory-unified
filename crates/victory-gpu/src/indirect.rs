@@ -366,6 +366,90 @@ pub(crate) fn bound_ahead(
     clamp_into(list, c, &dst, budget, src, None, spec, true).then_some(dst)
 }
 
+/// How clamps of indirect draws are recorded:
+/// - `0`: each clamp inline before its draw;
+/// - `1`: in a list before the list that draws, without inter-clamp barriers;
+/// - `2`: as `1`, plus a UAV barrier before each draw;
+/// - `3`: hoist mesh dispatches only;
+/// - `4`: hoist non-mesh draws only;
+/// - `5`: as `1`, always opening a fresh list for clamps;
+/// - `6`: cut lists as for `1`, but keep clamps inline;
+/// - `7` (default): as `1`, running clamps sequentially (UAV barrier between
+///   clamps) so list budgets are charged in draw order without mesh flicker.
+pub(crate) fn hoist_mode() -> u8 {
+    use std::sync::atomic::{AtomicU8, Ordering};
+    static MODE: AtomicU8 = AtomicU8::new(u8::MAX);
+    let mode = MODE.load(Ordering::Relaxed);
+    if mode == u8::MAX {
+        let set = std::env::var("VICTORY_HOIST_CLAMPS")
+            .ok()
+            .and_then(|v| v.trim().parse().ok())
+            .unwrap_or(7);
+        MODE.store(set, Ordering::Relaxed);
+        return set;
+    }
+    mode
+}
+
+/// Whether clamps of indirect draws go to a list before the one that draws.
+pub(crate) fn hoisting() -> bool {
+    hoist_mode() != 0
+}
+
+/// As [`bound`], recorded into `clamps`, a list that executes before the one
+/// that draws: returns `(buffer, offset)` of the clamped records, readable as
+/// indirect arguments once [`HostList::clamp_end`] has run on `clamps`.
+pub(crate) fn bound_before(
+    clamps: &HostList,
+    (src, src_offset): (&ID3D12Resource, u64),
+    count: Option<(&ID3D12Resource, u64)>,
+    (kind, stride, records): (u32, u32, u32),
+) -> Option<(ID3D12Resource, u64)> {
+    let bytes = validate_layout((kind, stride, records), src_offset, count.map(|(_, off)| off))?;
+    if records == 0 {
+        return None;
+    }
+    let (c, budget) = (clamp()?, clamps.budget()?);
+    // SAFETY: live D3D12 buffers.
+    let (src_base, count_base) =
+        unsafe { (src.GetGPUVirtualAddress(), count.map(|(b, _)| b.GetGPUVirtualAddress())) };
+    let fits = |offset: u64, len: u64| offset.checked_add(len).is_some_and(|end| end <= u64::from(u32::MAX));
+    let (src_gpu, args_offset) = if fits(src_offset, bytes) {
+        (src_base, src_offset as u32)
+    } else {
+        (src_base.checked_add(src_offset)?, 0)
+    };
+    let (count_gpu, has_count, count_offset) = match (count, count_base) {
+        (Some((_, off)), Some(base)) if fits(off, 4) => (base, 1u32, off as u32),
+        (Some((_, off)), Some(base)) => (base.checked_add(off)?, 1, 0),
+        _ => (src_gpu, 0, 0),
+    };
+    if !src_gpu.is_multiple_of(4) || !count_gpu.is_multiple_of(4) || !budget.is_multiple_of(4) {
+        return None;
+    }
+    let (dst, at) = clamps.clamp_room(bytes)?;
+    // SAFETY: live D3D12 buffer.
+    let dst_gpu = unsafe { dst.GetGPUVirtualAddress() } + at;
+    let constants = [kind, stride, records, args_offset, has_count, count_offset];
+    let l = &clamps.list;
+    // SAFETY: an open list; our root signature and pipeline; live source,
+    // count, destination (`clamp_room` in UNORDERED_ACCESS), and budget.
+    unsafe {
+        l.SetComputeRootSignature(&c.root);
+        l.SetPipelineState(&c.pso);
+        l.SetComputeRoot32BitConstants(0, 6, constants.as_ptr().cast(), 0);
+        l.SetComputeRootShaderResourceView(1, src_gpu);
+        l.SetComputeRootShaderResourceView(2, count_gpu);
+        l.SetComputeRootUnorderedAccessView(3, dst_gpu);
+        l.SetComputeRootUnorderedAccessView(4, budget);
+        l.Dispatch(records.div_ceil(64), 1, 1);
+        if hoist_mode() == 7 {
+            l.ResourceBarrier(&[uav_barrier()]);
+        }
+    }
+    Some((dst, at))
+}
+
 /// [`record_clamp_as`] into `list`'s scratch buffer `dst`, from the state
 /// the list left it in; afterwards the list knows it is readable as
 /// indirect arguments.
@@ -1642,6 +1726,57 @@ void main() {
         assert_eq!(host.log_messages(), None, "the debug layer found an error");
         host.execute(&[&list]);
         list.reset();
+    }
+
+    /// Exercises `HostList::clamp_room`, `bound_before`, `HostList::clamp_end`,
+    /// execution, and chunk reuse after `HostList::reset` on the host device.
+    #[test]
+    fn hoisted_clamps_pack_chunks_and_execute_cleanly() {
+        let Some(host) = super::host() else {
+            return;
+        };
+        let _ = host.log_messages();
+        let Ok(clamps) = host.new_list() else {
+            return;
+        };
+        let Some((src_buf, src_ptr)) = host.shared_buffer(256 << 10) else {
+            return;
+        };
+        let Some((count_buf, count_ptr)) = host.shared_buffer(256) else {
+            return;
+        };
+        // SAFETY: mapped host buffers.
+        unsafe {
+            std::ptr::write_bytes(src_ptr, 0x7F, 256 << 10);
+            (count_ptr as *mut u32).write_volatile(2);
+        }
+
+        let (b1, off1) = bound_before(&clamps, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 4096)).unwrap();
+        assert_eq!(off1, 0);
+        let (b2, off2) = bound_before(&clamps, (&src_buf, 64), Some((&count_buf, 0)), (1, 20, 64)).unwrap();
+        assert_eq!(b1.as_raw(), b2.as_raw(), "second small clamp shares first 256 KiB chunk");
+        assert_eq!(off2, 4096 * 16);
+
+        // Request exceeding remaining chunk space spills into a second chunk at offset 0.
+        let (b3, off3) = bound_before(&clamps, (&src_buf, 0), Some((&count_buf, 0)), (1, 20, 10000)).unwrap();
+        assert_ne!(b3.as_raw(), b1.as_raw(), "spill moves to next chunk");
+        assert_eq!(off3, 0);
+
+        clamps.clamp_end();
+        clamps.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&clamps]);
+        clamps.reset();
+
+        // After reset, the first chunk is reused from offset 0 again.
+        let (b4, off4) = bound_before(&clamps, (&src_buf, 0), Some((&count_buf, 0)), (0, 16, 16)).unwrap();
+        assert_eq!(b4.as_raw(), b1.as_raw(), "reset must reuse chunk 0");
+        assert_eq!(off4, 0);
+        clamps.clamp_end();
+        clamps.close();
+        assert_eq!(host.log_messages(), None, "the debug layer found an error");
+        host.execute(&[&clamps]);
+        clamps.reset();
     }
 
     /// A group charges its records in lane order: with 300 left of the
