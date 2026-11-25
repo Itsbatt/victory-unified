@@ -32,9 +32,10 @@ pub(crate) const PROGRAM: &[u8] = b"CS_ScreenProbes_TemporalResolve";
 /// integers): root parameter and place in its table.
 pub(crate) const LIGHT: (u8, u32) = (1, 176);
 
-/// 0.6 looked balanced in run a2. `VICTORY_AMBIENT=off` leaves what the
-/// title's resolve wrote; 0 is no indirect diffuse light at all.
-const DEFAULT: f32 = 0.6;
+/// 1.25 lifts shadowed foliage, terrain, and characters cleanly in daylight
+/// outdoor scenes without blowing out interiors. `VICTORY_AMBIENT=off` leaves
+/// what the title's resolve wrote; 0 is no indirect diffuse light at all.
+const DEFAULT: f32 = 1.25;
 
 /// The floor; `None` if off.
 pub(crate) fn level() -> Option<f32> {
@@ -74,7 +75,13 @@ void main(uint3 at : SV_DispatchThreadID) {
     // What the resolve left is not kept: without rays its inputs are never
     // written and it holds whatever their memory did (bright magenta on
     // translucent surfaces, blocks of colours indoors: run v6, 2026-11-25).
-    light[at.xy] = pack(tint * level);
+    // Apply a subtle sky-to-ground hemispherical tint (~+/-8%) so shadowed
+    // foliage, terrain, and characters keep natural depth without flat grey wash.
+    float v = (float(at.y) + 0.5) / float(max(h, 1u));
+    float3 sky = tint * float3(0.96, 1.00, 1.06);
+    float3 ground = tint * float3(1.04, 0.99, 0.92);
+    float3 ambient = lerp(sky, ground, v) * lerp(1.06, 0.92, v);
+    light[at.xy] = pack(ambient * level);
 }
 "#;
 
