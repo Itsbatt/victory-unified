@@ -1156,25 +1156,36 @@ fn pooled(n: usize) -> Vec<u8> {
         .map(|(i, _)| i);
     let mut v = match fit {
         Some(i) => pool.swap_remove(i),
-        None => Vec::with_capacity(n),
+        None => {
+            let mut buf = Vec::new();
+            if buf.try_reserve(n).is_err() {
+                pool.clear();
+                pool.shrink_to_fit();
+                drop(pool);
+                let mut retry = Vec::new();
+                retry.reserve(n);
+                retry
+            } else {
+                buf
+            }
+        }
     };
     v.clear();
     v
 }
 
-/// Returns a snapshot buffer to the pool: at most 8 kept, the largest, and
-/// of those the largest one and the next ones up to `KEPT` bytes in all.
+/// Returns a snapshot buffer to the pool: at most 4 kept, the largest, up to
+/// `KEPT` bytes in all.
 fn give_back(v: Vec<u8>) {
-    const KEPT: usize = 512 << 20;
+    const KEPT: usize = 64 << 20;
     let mut pool = POOL.lock().unwrap_or_else(|e| e.into_inner());
     pool.push(v);
     pool.sort_by_key(|v| std::cmp::Reverse(v.capacity()));
-    pool.truncate(8);
-    let (mut seen, mut total) = (0, 0usize);
+    pool.truncate(4);
+    let mut total = 0usize;
     pool.retain(|v| {
-        seen += 1;
         total = total.saturating_add(v.capacity());
-        seen == 1 || total <= KEPT
+        total <= KEPT
     });
 }
 

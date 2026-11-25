@@ -1013,6 +1013,35 @@ pub(crate) fn presented() -> u64 {
 ///
 /// shortcut: one plane, no scaling or placement, the source expected in
 /// the common state.
+fn frame_pace() {
+    static MAX_FPS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    static LAST_PRESENT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let max_fps = *MAX_FPS.get_or_init(|| {
+        std::env::var("VICTORY_MAX_FPS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30)
+    });
+    if max_fps == 0 {
+        return;
+    }
+    let min_frame = std::time::Duration::from_micros(1_000_000 / max_fps);
+    let mut last = LAST_PRESENT.lock().unwrap_or_else(|e| e.into_inner());
+    let now = std::time::Instant::now();
+    if let Some(prev) = *last {
+        let elapsed = now.saturating_duration_since(prev);
+        if elapsed < min_frame {
+            let remaining = min_frame - elapsed;
+            drop(last);
+            std::thread::sleep(remaining);
+            let mut last = LAST_PRESENT.lock().unwrap_or_else(|e| e.into_inner());
+            *last = Some(std::time::Instant::now());
+            return;
+        }
+    }
+    *last = Some(now);
+}
+
 extern "system" fn present(
     this: This,
     planes: u32,
@@ -1027,6 +1056,7 @@ extern "system" fn present(
         crate::framelog::add(crate::framelog::T::PresentUs, presenting.elapsed().as_micros() as u64);
         crate::framelog::frame();
     }
+    frame_pace();
     hr
 }
 

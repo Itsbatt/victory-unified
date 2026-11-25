@@ -1,32 +1,40 @@
-# VIctory fork (work in progress)
+# victory-unified
 
-A work-in-progress fork of [VIctory](https://github.com/Marvisak/VIctory), a
-compatibility layer that runs an Xbox Series title natively on Windows from
-files the user supplies. This fork follows upstream
-`main` and adds fixes aimed at one goal: getting the game's world to render
-correctly and playably on one particular PC.
+A unified fork by **[Itsbatt](https://github.com/Itsbatt)** (built and tuned with **Antigravity / Google Deepmind AI**) combining the latest performance and rendering advances from **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**, **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**, and **[Zettrox/ztrx](https://github.com/Zettrox/ztrx)** on top of **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)**.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
 developer or publisher.
 
+## What this unified fork adds
+
+- **Graphics & Lighting:**
+  - **Indirect diffuse / ambient light (`crates/victory-gpu/src/ambient.rs`, `VICTORY_AMBIENT=0.6`):** Ported from `Belobug/VIctory-Belobug-AMD` (`4f45ab8`). Replaces uncomputed ray-traced indirect diffuse output with a balanced constant floor, eliminating pitch-black shadows and magenta artifacts on foliage and indoors.
+  - **Helper-lane quad reads (`crates/victory-shader/src/emit/lower.rs`):** Ported from `Belobug/VIctory-Belobug-AMD` (`03629f3`). Pixel shader quad operations read helper pixels so triangle edges no longer show lines on car paint, glass, and skin.
+  - **Full `fxceless/victory-fork` rendering base (`0b0074e`):** Depth bounds test (`#82`), character bake/skin/hair texture rechecking (`VICTORY_HEAP_RECHECK`), first-room descriptor mirroring, `VICTORY_LEVELS_ON_DEMAND=1`, and 59/64 trace programs.
+- **Performance, Stability & Input:**
+  - **Tuned launcher (`scripts/play.ps1`):** Enables `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_REFRESH_ONCE=1`, `VICTORY_QUEUE2=1`, `VICTORY_QUEUE2_LANDING_MB=128`, `VICTORY_COPY_PLAIN=1`, `VICTORY_INDIRECT_WINDOW=1`, `VICTORY_TEXTURE_NO_WAIT=1`, `VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`, `VICTORY_MERGE_GAP=64`, `VICTORY_MERGE_RUNS=4096`, `VICTORY_JOIN_COPIES=1`, `VICTORY_CARD_REHASH_RUNS=1`, `VICTORY_VIEW_KNOWN=1`, `VICTORY_UNWATCHED_FRAMES=4`, `VICTORY_DISK_CORES=slow`, and `VICTORY_WINDOW_KB=256` + `VICTORY_WINDOW_TAILS=1`.
+  - **30 FPS frame cap (`VICTORY_MAX_FPS=30` in `crates/victory-gpu/src/queue.rs`):** Caps menus/loading screens cleanly at 30 FPS.
+  - **Lower commit memory (`crates/victory-gpu/src/shadow.rs`):** Caps the idle snapshot pool at `64 MiB` and drains it on tight commit memory before retrying allocations.
+  - **Keyboard + XInput pad support (`crates/victory-hle/src/modules/gameinput.rs`):** Maps `Space` alongside `Enter` to `A`, and keeps keyboard fallback buttons active on slot `0` while focused even when a physical or virtual XInput controller (e.g., DS4Windows) is connected.
+
+## Quick Play
+
+```powershell
+cargo build --release -p victory
+powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game folder>\<the game's exe>"
+```
+
 ## Credits
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors is the base of everything here: the loader, the runtime
-  services, the Direct3D 12 back end and the shader recompiler. Licensed
-  GPL-3.0-or-later; so is this fork. Upstream's history is kept intact below
-  the single commit that carries this fork's changes.
-- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors
-  (GPL-2.0-only) was used as a reference for how the same title behaves under
-  another layer. Fixes inspired by it were written anew in VIctory's code.
-- The guard over every view of a memory page is code by **myokex**
-  ([victory-amd](https://github.com/myokex/victory-amd), commit `c6dc4d8`), which
-  adapts pull request #115 here by Spexivus, its correction by joroyt and a part of
-  VIctory #1122 by tightfall. The read-beside fix for kernel reads into title
-  memory is by **Joshua Odom** (commit `10ea38e` of the same fork family). Both
-  are carried here unchanged apart from one merge conflict.
-- This fork's changes were developed with [Claude Code](https://claude.com/claude-code).
+- **[Itsbatt](https://github.com/Itsbatt)** & **Antigravity (Google Deepmind AI)** — unification, performance tuning, memory pool hardening, frame limiter, and input fixes in this repository.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** (`0b0074e`) — async submission/copy queue, plain-copy path, fast descriptor sync, depth bounds test (`#82`), trace shader translation, character texture recheck, and `VICTORY_LEVELS_ON_DEMAND`.
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)** (`4f45ab8`, `03629f3`) — indirect ambient light pass (`ambient.rs` / `VICTORY_AMBIENT`) and pixel-shader helper-lane quad reads.
+- **[Zettrox/ztrx](https://github.com/Zettrox/ztrx)** — streamlined Windows play script structure and defaults.
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its contributors is the base of everything here: the loader, the runtime services, the Direct3D 12 back end and the shader recompiler. Licensed GPL-3.0-or-later; so is this fork.
+- **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors (GPL-2.0-only) was used as a reference for how the same title behaves under another layer.
+- **myokex** ([victory-amd](https://github.com/myokex/victory-amd), commit `c6dc4d8`, adapting PR #115 by Spexivus, joroyt, and #1122 by tightfall) and **Joshua Odom** (`10ea38e`) — memory page guards and read-beside fixes.
+- Upstream `fxceless` changes were developed with [Claude Code](https://claude.com/claude-code).
 
 ## Status of this fork (2026-11-25)
 
