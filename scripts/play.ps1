@@ -34,12 +34,13 @@ $env:VICTORY_VIEW_KNOWN = "1"
 $env:VICTORY_UNWATCHED_FRAMES = "4"
 $env:VICTORY_DISK_CORES = "slow"
 $env:VICTORY_PIPELINE_WAIT_MS = "24"
-# Graphics & stability (Belobug ambient + quad reads + 256 KiB windows + 30fps menu cap)
+# Graphics & stability (Belobug ambient/quads + DexNom shader/PSO fixes + 8 GB GPU TDR/VRAM headroom)
 $env:VICTORY_AMBIENT = "0.6"
 $env:VICTORY_MAX_FPS = "30"
 $env:VICTORY_WINDOW_KB = "256"
 $env:VICTORY_WINDOW_TAILS = "1"
-$env:VICTORY_TEXTURE_BUDGET_MB = "2560"
+$env:VICTORY_LATE_WAIT_LISTS = "128"
+$env:VICTORY_TEXTURE_BUDGET_MB = "2048"
 $env:RUST_BACKTRACE = "1"
 $env:VICTORY_LOG = "warn"
 & $Exe run $Game --execute 2>&1 | Out-File "$env:TEMP\ztrx.log" -Encoding utf8

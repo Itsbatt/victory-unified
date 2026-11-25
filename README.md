@@ -1,6 +1,6 @@
 # victory-unified
 
-A unified fork by **[Itsbatt](https://github.com/Itsbatt)** (built and tuned with **Antigravity / Google Deepmind AI**) combining the latest performance and rendering advances from **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**, **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**, and **[Zettrox/ztrx](https://github.com/Zettrox/ztrx)** on top of **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)**.
+A unified fork by **[Itsbatt](https://github.com/Itsbatt)** (built and tuned with **Antigravity / Google Deepmind AI**) combining the latest performance, shader/pipeline fixes, and rendering advances from **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**, **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**, **[DexNom/VIctory](https://github.com/DexNom/VIctory)**, and **[Zettrox/ztrx](https://github.com/Zettrox/ztrx)** on top of **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)**.
 
 **This repository contains no game files, code or assets.** You need your own
 copy of the game. It is not affiliated with or endorsed by the game's
@@ -10,10 +10,16 @@ developer or publisher.
 
 - **Graphics & Lighting:**
   - **Indirect diffuse / ambient light (`crates/victory-gpu/src/ambient.rs`, `VICTORY_AMBIENT=0.6`):** Ported from `Belobug/VIctory-Belobug-AMD` (`4f45ab8`). Replaces uncomputed ray-traced indirect diffuse output with a balanced constant floor, eliminating pitch-black shadows and magenta artifacts on foliage and indoors.
-  - **Helper-lane quad reads (`crates/victory-shader/src/emit/lower.rs`):** Ported from `Belobug/VIctory-Belobug-AMD` (`03629f3`). Pixel shader quad operations read helper pixels so triangle edges no longer show lines on car paint, glass, and skin.
+  - **Helper-lane quad reads (`crates/victory-shader/src/emit/lower.rs`):** Ported from `Belobug/VIctory-Belobug-AMD` (`03629f3`) and extended with `DexNom/VIctory` (`921d8d3`) fast quad intrinsics (`quadReadLaneAt`/`quadOp`) and quad-local `DPP8` support. Pixel shader quad operations preserve helper pixels so triangle edges no longer show lines on car paint, glass, and skin.
+  - **Shader, cubemap & PSO fixes ported from `DexNom/VIctory` (`ddb7332`, `76749ce`, `5f4c3df`, `921d8d3`):**
+    - Uniform branching across immediate static samplers (`lower.rs`, +40 shader variants).
+    - Restored `wave64` scalar-copy lane mask recognition (`structure.rs`, voxel visibility).
+    - Vertex output signature ordering by name offset, declared PSV interpolation, and matching unused packed PS inputs (`container.rs`, `emit/mod.rs`, `shader.rs`, fixing DXIL validation on 39 vertex shaders including 18 water shaders).
+    - Cube-map explicit-gradient LOD fix (`LOG2_E` double-scaling bug removed + min-LOD clamp) and `CalculateLOD` spatial coordinate fix (`lower.rs`).
+    - Integer render-target blend bypass on mixed MRTs (`pipeline/host.rs`, `pipeline.rs`, fixing strict D3D12 PSO validation) and depth-only pipeline pre-warming priority (`pipeline/make.rs`).
   - **Full `fxceless/victory-fork` rendering base (`0b0074e`):** Depth bounds test (`#82`), character bake/skin/hair texture rechecking (`VICTORY_HEAP_RECHECK`), first-room descriptor mirroring, `VICTORY_LEVELS_ON_DEMAND=1`, and 59/64 trace programs.
 - **Performance, Stability & Input:**
-  - **Tuned launcher (`scripts/play.ps1`):** Enables `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_REFRESH_ONCE=1`, `VICTORY_QUEUE2=1`, `VICTORY_QUEUE2_LANDING_MB=128`, `VICTORY_COPY_PLAIN=1`, `VICTORY_INDIRECT_WINDOW=1`, `VICTORY_TEXTURE_NO_WAIT=1`, `VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`, `VICTORY_MERGE_GAP=64`, `VICTORY_MERGE_RUNS=4096`, `VICTORY_JOIN_COPIES=1`, `VICTORY_CARD_REHASH_RUNS=1`, `VICTORY_VIEW_KNOWN=1`, `VICTORY_UNWATCHED_FRAMES=4`, `VICTORY_DISK_CORES=slow`, and `VICTORY_WINDOW_KB=256` + `VICTORY_WINDOW_TAILS=1`.
+  - **Tuned launcher (`scripts/play.ps1`):** Enables `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_REFRESH_ONCE=1`, `VICTORY_QUEUE2=1`, `VICTORY_QUEUE2_LANDING_MB=128`, `VICTORY_COPY_PLAIN=1`, `VICTORY_INDIRECT_WINDOW=1`, `VICTORY_TEXTURE_NO_WAIT=1`, `VICTORY_LEVELS_ON_DEMAND=1`, `VICTORY_CARD_BUFFERS_MIN_MB=1`, `VICTORY_CARD_BUFFERS_MB=1024`, `VICTORY_MERGE_GAP=64`, `VICTORY_MERGE_RUNS=4096`, `VICTORY_JOIN_COPIES=1`, `VICTORY_CARD_REHASH_RUNS=1`, `VICTORY_VIEW_KNOWN=1`, `VICTORY_UNWATCHED_FRAMES=4`, `VICTORY_DISK_CORES=slow`, `VICTORY_PIPELINE_WAIT_MS=24`, `VICTORY_LATE_WAIT_LISTS=128`, `VICTORY_TEXTURE_BUDGET_MB=2048`, and `VICTORY_WINDOW_KB=256` + `VICTORY_WINDOW_TAILS=1`.
   - **30 FPS frame cap (`VICTORY_MAX_FPS=30` in `crates/victory-gpu/src/queue.rs`):** Caps menus/loading screens cleanly at 30 FPS.
   - **Lower commit memory (`crates/victory-gpu/src/shadow.rs`):** Caps the idle snapshot pool at `64 MiB` and drains it on tight commit memory before retrying allocations.
   - **Keyboard + XInput pad support (`crates/victory-hle/src/modules/gameinput.rs`):** Maps `Space` alongside `Enter` to `A`, and keeps keyboard fallback buttons active on slot `0` while focused even when a physical or virtual XInput controller (e.g., DS4Windows) is connected.
@@ -36,8 +42,8 @@ Tested on **Microsoft Windows 11 Pro** (`10.0.26300`, 64-bit) using the **Xbox S
 | Area | Verified Result on Test Machine |
 |---|---|
 | Boot, menus, start screen | Works; capped at `30 fps` (`VICTORY_MAX_FPS=30`); `Enter` / `Space` mapped to `A` |
-| Progression reached | Advances past menus into the opening intro, first room, and world entry (`ambient light` active) |
-| Stability (this branch) | `180 s` (3 min) continuous in-world `diag` run with `0` crashes / `0` device losses (`120 s` also verified with `VICTORY_REFRESH_ONCE=1` + `VICTORY_QUEUE2_LANDING_MB=128`) |
+| Progression reached | Advances past menus, opening intro, first room, and into gameplay (`Player` + `SARC0015` autosave reached; `ambient light` active) |
+| Long-run stability | **49m 42s** continuous play (`16:07:51` → `16:57:33` on pre-DexNom build) before hitting `0x887A0006` (`DXGI_ERROR_DEVICE_HUNG`) with `27` submissions / `172` lists queued ahead (`VICTORY_LATE_WAIT_LISTS=128` + `VICTORY_TEXTURE_BUDGET_MB=2048` + DexNom shader/PSO fixes applied to mitigate) |
 | Frame time & utilization | `425 ms` on a heavy `9,940`-draw frame under `diag` telemetry (`0.0 ms` CPU card wait, `2.2 ms` heap pass, `4.9 ms` texture refreshes, `77%` GPU busy); `~2+ fps` in normal `release` play |
 | Memory footprint | `19.66–20.51 GB` commit / `15.13–15.40 GB` active RAM in-world (requires adequate Windows commit memory; `2–4 GB` pagefile caused OOM in `shadow::pooled`) |
 | Known incompatibilities on this GPU | `VICTORY_ASYNC_PRESENT=1` crashed in `nvwgf2umx.dll` (kept off); `--console series-s` hit `0x887A0001` in `FFX_FSR4` (Series X used) |
@@ -47,6 +53,7 @@ Tested on **Microsoft Windows 11 Pro** (`10.0.26300`, 64-bit) using the **Xbox S
 - **[Itsbatt](https://github.com/Itsbatt)** & **Antigravity (Google Deepmind AI)** — unification, performance tuning, memory pool hardening, frame limiter, and input fixes in this repository.
 - **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** (`0b0074e`) — async submission/copy queue, plain-copy path, fast descriptor sync, depth bounds test (`#82`), trace shader translation, character texture recheck, and `VICTORY_LEVELS_ON_DEMAND`.
 - **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)** (`4f45ab8`, `03629f3`) — indirect ambient light pass (`ambient.rs` / `VICTORY_AMBIENT`) and pixel-shader helper-lane quad reads.
+- **[DexNom/VIctory](https://github.com/DexNom/VIctory)** (`ddb7332`, `76749ce`, `5f4c3df`, `921d8d3`) — uniform static-sampler branching, `wave64` scalar-copy mask recovery, vertex signature order & interpolation validation fixes, cubemap explicit-LOD & `CalculateLOD` fixes, quad-op/DPP8 improvements, integer-target blend bypass, and depth-only PSO pre-warming priority.
 - **[Zettrox/ztrx](https://github.com/Zettrox/ztrx)** — streamlined Windows play script structure and defaults.
 - **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its contributors is the base of everything here: the loader, the runtime services, the Direct3D 12 back end and the shader recompiler. Licensed GPL-3.0-or-later; so is this fork.
 - **[XCL](https://github.com/ivall/xcl)** by ivall and its contributors (GPL-2.0-only) was used as a reference for how the same title behaves under another layer.
