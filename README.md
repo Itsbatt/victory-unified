@@ -25,6 +25,23 @@ cargo build --release -p victory
 powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game folder>\<the game's exe>"
 ```
 
+## Tested Hardware & Status (2026-11-25)
+
+Tested on **Microsoft Windows 11 Pro** (`10.0.26300`, 64-bit) using the **Xbox Series X** profile:
+
+- **CPU:** AMD Ryzen 5 5600XT (6 cores / 12 threads)
+- **GPU:** NVIDIA GeForce RTX 3070 (8 GB VRAM, driver `32.0.16.2114`)
+- **Memory:** `31.93 GB` RAM, `47.93 GB` total virtual commit (`C:\pagefile.sys` set to `16384–24576 MB` on SATA SSD)
+
+| Area | Verified Result on Test Machine |
+|---|---|
+| Boot, menus, start screen | Works; capped at `30 fps` (`VICTORY_MAX_FPS=30`); `Enter` / `Space` mapped to `A` |
+| Progression reached | Advances past menus into the opening intro, first room, and world entry (`ambient light` active) |
+| Stability (this branch) | `180 s` (3 min) continuous in-world `diag` run with `0` crashes / `0` device losses (`120 s` also verified with `VICTORY_REFRESH_ONCE=1` + `VICTORY_QUEUE2_LANDING_MB=128`) |
+| Frame time & utilization | `425 ms` on a heavy `9,940`-draw frame under `diag` telemetry (`0.0 ms` CPU card wait, `2.2 ms` heap pass, `4.9 ms` texture refreshes, `77%` GPU busy); `~2+ fps` in normal `release` play |
+| Memory footprint | `19.66–20.51 GB` commit / `15.13–15.40 GB` active RAM in-world (requires adequate Windows commit memory; `2–4 GB` pagefile caused OOM in `shadow::pooled`) |
+| Known incompatibilities on this GPU | `VICTORY_ASYNC_PRESENT=1` crashed in `nvwgf2umx.dll` (kept off); `--console series-s` hit `0x887A0001` in `FFX_FSR4` (Series X used) |
+
 ## Credits
 
 - **[Itsbatt](https://github.com/Itsbatt)** & **Antigravity (Google Deepmind AI)** — unification, performance tuning, memory pool hardening, frame limiter, and input fixes in this repository.
