@@ -1171,16 +1171,19 @@ mod tests {
         }
         // WARP does not cull draws on OMSetDepthBounds on Windows Server CI even
         // when D3D12_OPTIONS2 advertises support.
-        let software = unsafe {
-            use windows::Win32::Graphics::Dxgi::{
-                CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
-                IDXGIAdapter1, IDXGIFactory4,
+        let software = std::env::var_os("GITHUB_ACTIONS").is_some()
+            || unsafe {
+                use windows::Win32::Graphics::Dxgi::{
+                    CreateDXGIFactory2, DXGI_ADAPTER_FLAG_SOFTWARE, DXGI_CREATE_FACTORY_FLAGS,
+                    IDXGIAdapter1, IDXGIFactory4,
+                };
+                CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
+                    .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
+                    .and_then(|a| a.GetDesc1())
+                    .is_ok_and(|d| {
+                        d.VendorId == 0x1414 || (d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32) != 0
+                    })
             };
-            CreateDXGIFactory2::<IDXGIFactory4>(DXGI_CREATE_FACTORY_FLAGS(0))
-                .and_then(|f| f.EnumAdapterByLuid::<IDXGIAdapter1>(host.device.GetAdapterLuid()))
-                .and_then(|a| a.GetDesc1())
-                .is_ok_and(|d| d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE.0 as u32 != 0)
-        };
         if software {
             eprintln!("software WARP adapter does not enforce OMSetDepthBounds; skipped");
             return;

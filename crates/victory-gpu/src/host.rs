@@ -118,12 +118,13 @@ pub(crate) fn available_physical_ram() -> Option<u64> {
 }
 
 /// Effective idle timeout (in milliseconds) for VRAM-backed host textures,
-/// scaled down under VRAM pressure. Never returns less than 1,000 ms so
-/// handles not yet recorded into a list or slot remain protected.
+/// scaled down under VRAM pressure. Never returns less than 4,000 ms so
+/// handles not yet recorded into a list or slot remain protected even across
+/// multi-hundred-millisecond preparation frames and multi-threaded recording.
 pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
-    const NORMAL_MS: u64 = 5_000;
-    const MODERATE_MS: u64 = 2_500;
-    const HIGH_MS: u64 = 1_000;
+    const NORMAL_MS: u64 = 10_000;
+    const MODERATE_MS: u64 = 6_000;
+    const HIGH_MS: u64 = 4_000;
     let Some([budget, used, ..]) = video_memory else {
         return NORMAL_MS;
     };
@@ -142,12 +143,12 @@ pub(crate) fn vram_idle_ms(video_memory: Option<[u64; 4]>) -> u64 {
 
 /// Effective idle timeout (in milliseconds) for system-RAM caches (staging
 /// buffers, loose shadows, and the mapped pipeline library), scaled down
-/// when free physical RAM is low. Never returns less than 2,000 ms.
+/// when free physical RAM is low. Never returns less than 5,000 ms.
 pub(crate) fn ram_idle_ms(avail_phys: Option<u64>) -> u64 {
     const GIB: u64 = 1024 * 1024 * 1024;
-    const NORMAL_MS: u64 = 10_000;
-    const MODERATE_MS: u64 = 5_000;
-    const HIGH_MS: u64 = 2_000;
+    const NORMAL_MS: u64 = 15_000;
+    const MODERATE_MS: u64 = 10_000;
+    const HIGH_MS: u64 = 5_000;
     let Some(avail) = avail_phys else {
         return NORMAL_MS;
     };
@@ -8377,18 +8378,18 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         use super::vram_idle_ms;
         let gib = 1024 * 1024 * 1024;
         // Normal (< 75%)
-        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 5_000);
-        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 0, 0, 0])), 10_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 7 * gib, 0, 0])), 10_000);
+        assert_eq!(vram_idle_ms(Some([100, 74, 0, 0])), 10_000);
         // Moderate (75%..85%)
-        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 2_500);
-        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 2_500);
+        assert_eq!(vram_idle_ms(Some([100, 75, 0, 0])), 6_000);
+        assert_eq!(vram_idle_ms(Some([100, 84, 0, 0])), 6_000);
         // High (>= 85%, including over-budget)
-        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 1_000);
-        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 1_000);
+        assert_eq!(vram_idle_ms(Some([100, 85, 0, 0])), 4_000);
+        assert_eq!(vram_idle_ms(Some([10 * gib, 12 * gib, 0, 0])), 4_000);
         // Missing or zero budget falls back to normal
-        assert_eq!(vram_idle_ms(None), 5_000);
-        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 5_000);
+        assert_eq!(vram_idle_ms(None), 10_000);
+        assert_eq!(vram_idle_ms(Some([0, 100, 0, 0])), 10_000);
     }
 
     #[test]
@@ -8396,16 +8397,16 @@ mod batch {   // Batch::texture_due lives here; `mod tests` is already taken at 
         use super::ram_idle_ms;
         let gib = 1024 * 1024 * 1024;
         // Normal (>= 4 GiB)
-        assert_eq!(ram_idle_ms(Some(8 * gib)), 10_000);
-        assert_eq!(ram_idle_ms(Some(4 * gib)), 10_000);
+        assert_eq!(ram_idle_ms(Some(8 * gib)), 15_000);
+        assert_eq!(ram_idle_ms(Some(4 * gib)), 15_000);
         // Moderate (2 GiB..4 GiB)
-        assert_eq!(ram_idle_ms(Some(4 * gib - 1)), 5_000);
-        assert_eq!(ram_idle_ms(Some(2 * gib)), 5_000);
+        assert_eq!(ram_idle_ms(Some(4 * gib - 1)), 10_000);
+        assert_eq!(ram_idle_ms(Some(2 * gib)), 10_000);
         // High (< 2 GiB)
-        assert_eq!(ram_idle_ms(Some(2 * gib - 1)), 2_000);
-        assert_eq!(ram_idle_ms(Some(0)), 2_000);
+        assert_eq!(ram_idle_ms(Some(2 * gib - 1)), 5_000);
+        assert_eq!(ram_idle_ms(Some(0)), 5_000);
         // Missing falls back to normal
-        assert_eq!(ram_idle_ms(None), 10_000);
+        assert_eq!(ram_idle_ms(None), 15_000);
     }
 }
 
