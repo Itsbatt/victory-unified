@@ -1507,6 +1507,15 @@ impl State {
         if self.depth != 0 {
             // A depth texture shaders also write: what they wrote, first.
             list.twin_use(self.depth as This, false, true);
+            if list.take_plane_clobbered() {
+                let tested = TESTED_DEPTH.get();
+                self.replay(list);
+                let ok = self.bind(list, p, false);
+                TESTED_DEPTH.set(tested);
+                if !ok {
+                    return false;
+                }
+            }
             // A view that writes neither plane keeps the texture readable:
             // the depth read state, together with the shader read states
             // if this draw's shaders read the same texture (the write state
@@ -1535,6 +1544,9 @@ impl State {
     /// False if the draw or dispatch must not run: a root SRV it reads
     /// could not be given a view.
     pub(crate) fn bind(&mut self, list: &HostList, p: &HostPipeline, compute: bool) -> bool {
+        if list.take_plane_clobbered() {
+            self.replay(list);
+        }
         let l = &list.list;
         // Textures picked by index, before anything asks for them.
         self.early_textures(list, p, compute);
@@ -1810,6 +1822,10 @@ impl State {
                     return false;
                 }
             }
+        }
+        if list.take_plane_clobbered() {
+            self.replay(list);
+            return self.bind(list, p, compute);
         }
         // Depth textures it writes through unordered access: their colour
         // twins hold what they lack from here on.

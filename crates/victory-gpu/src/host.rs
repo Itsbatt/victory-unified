@@ -1317,6 +1317,9 @@ pub(crate) struct HostList {
     /// Scratch buffers of the batched clamps (`crate::indirect::batch`), and
     /// how many batches of this recording have a place in them.
     batch_args: Mutex<(Vec<ID3D12Resource>, u32)>,
+    /// True if a mid-list [`Self::pass_plane`] run clobbered graphics/descriptor
+    /// bindings on `list` and the caller's draw state should replay.
+    plane_clobbered: std::sync::atomic::AtomicBool,
     /// Refreshes of host copies that a thread of ours is still finding, and
     /// where among the list's steps they belong ([`aside`]).
     coming: Mutex<Option<(usize, std::sync::Arc<aside::Coming>)>>,
@@ -4287,6 +4290,7 @@ impl Host {
                 card_budget: OnceLock::new(),
                 indirect_args: Mutex::default(),
                 batch_args: Mutex::default(),
+                plane_clobbered: std::sync::atomic::AtomicBool::new(false),
                 coming: Mutex::default(),
                 epoch: std::sync::atomic::AtomicU64::new(next_epoch()),
                 _alive: Counted::new(),
@@ -6563,6 +6567,7 @@ impl HostList {
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
         self.twins.lock().unwrap_or_else(|e| e.into_inner()).clear();
+        self.plane_clobbered.store(false, Ordering::Relaxed);
         self.pipelines.lock().unwrap_or_else(|e| e.into_inner()).clear();
         #[cfg(feature = "diagnostics")]
         self.indirects.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -6677,6 +6682,17 @@ impl HostList {
     /// (also when the draw only tests), and every unordered access view a
     /// shader names as written; views a shader picks from the heap by a
     /// computed index are not seen here at all.
+    /// Whether a mid-list [`Self::pass_plane`] ran and clobbered host
+    /// command-list bindings since the last check.
+    pub(crate) fn has_plane_clobbered(&self) -> bool {
+        self.plane_clobbered.load(Ordering::Acquire)
+    }
+
+    /// Consumes the [`Self::has_plane_clobbered`] flag.
+    pub(crate) fn take_plane_clobbered(&self) -> bool {
+        self.plane_clobbered.swap(false, Ordering::AcqRel)
+    }
+
     pub(crate) fn twin_use(
         &self,
         resource: crate::object::This,
@@ -6723,14 +6739,12 @@ impl HostList {
         if was != (u.needs, u.behind, u.writing) || copy || colour {
             self.changed_something();
         }
-        // shortcut: the depth plane's twin is not drawn into the plane
-        // here: the pass sets a pipeline and a target of ours, which a list
-        // still recording the title's commands cannot take. This use sees
-        // the plane as it was; the pass runs when the list closes
-        // (`twins_to_depth`). Counted.
-        if copy && !colour && twin.plane.is_some() {
-            u.late = true;
-            crate::resource::PLANES[2].fetch_add(1, Ordering::Relaxed);
+        // Flush the depth plane's twin immediately before the mid-list depth
+        // use rather than deferring to `twins_to_depth` (`list.close()`), and
+        // signal callers to replay any clobbered command-list state.
+        let flush_plane = copy && !colour && twin.plane.is_some();
+        if flush_plane {
+            u.late = false;
         }
         drop(twins);
         if copy {
@@ -6741,6 +6755,10 @@ impl HostList {
         // The depth plane's twin is written through unordered access too.
         if colour && let Some(plane) = &twin.plane {
             self.settle(plane, UNORDERED_ACCESS);
+        }
+        if flush_plane {
+            self.pass_plane(&depth, &twin);
+            self.plane_clobbered.store(true, Ordering::Release);
         }
         true
     }

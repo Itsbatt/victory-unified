@@ -160,6 +160,19 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     crate::copystat::recorded(started);
 }
 
+/// Restores draw/compute state cached in `List::state` if a mid-list depth
+/// plane pass clobbered the host command list during a copy, resolve or clear.
+#[cfg(windows)]
+fn replay_if_clobbered(this: This, list: &crate::host::HostList) {
+    if list.has_plane_clobbered() {
+        with_state(this, |list, state| {
+            if list.take_plane_clobbered() {
+                state.replay(list);
+            }
+        });
+    }
+}
+
 /// The submission of `lists` has run: each gives its descriptor tables'
 /// slots back ([`crate::draw::State::tables_done`]). A list cut at waits
 /// keeps them: its state goes with its last part.
@@ -942,6 +955,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
                         "a copy between two title textures that share one host texture is left out: the first one"
                     );
                 });
+                replay_if_clobbered(this, list);
                 return;
             }
             ensure_state(list, dst, COPY_DEST);
@@ -956,6 +970,7 @@ extern "system" fn copy_resource(this: This, dst: This, src: This) {
         ) {
             buffer_copy(this, list, to, from, a.min(b) as usize);
         }
+        replay_if_clobbered(this, list);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, src);
@@ -1014,6 +1029,7 @@ extern "system" fn copy_texture_region(
             if n <= 16 || n.is_multiple_of(4096) || made.is_err() {
                 static REFUSED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 if made.is_err() && REFUSED.fetch_add(1, std::sync::atomic::Ordering::Relaxed) >= 16 {
+                    replay_if_clobbered(this, list);
                     return;
                 }
                 let source = crate::resource::host_resource(src.resource).map(|r| {
@@ -1032,6 +1048,7 @@ extern "system" fn copy_texture_region(
                     "a texture to buffer copy (a read back)"
                 );
             }
+            replay_if_clobbered(this, list);
             return;
         };
         if unlike(dst.resource, src.resource) {
@@ -1179,6 +1196,7 @@ extern "system" fn copy_texture_region(
                 host_box,
             )
         };
+        replay_if_clobbered(this, list);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, x, y, z, src, source_box);
@@ -1326,6 +1344,7 @@ extern "system" fn resolve(
                 );
             }
         }
+        replay_if_clobbered(this, list);
     }
     #[cfg(not(windows))]
     let _ = (this, dst, dst_sub, src, src_sub, format);
@@ -1427,6 +1446,7 @@ extern "system" fn clear_dsv(
             list.list
                 .ClearDepthStencilView(dsv, D3D12_CLEAR_FLAGS(flags as i32 & 3), depth, stencil, rects)
         };
+        replay_if_clobbered(this, list);
     }
     #[cfg(not(windows))]
     let _ = (this, handle, flags, depth, stencil, count, rects);

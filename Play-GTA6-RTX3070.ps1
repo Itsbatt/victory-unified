@@ -40,22 +40,30 @@ $settings = @{
     # Hardware targeting: NVIDIA RTX 3070 (8 GB VRAM)
     VICTORY_D3D12_ADAPTER      = 'NVIDIA'
 
-    # 8 GB VRAM & buffer management: move >=1MB buffers to GPU to cut 33ms CPU snapshots, keep windows small
-    VICTORY_CARD_WINDOWS_MB      = '256'
-    VICTORY_CARD_BUFFERS_MIN_MB  = '1'
-    VICTORY_CARD_BUFFERS_MB      = '1024'
-    VICTORY_TEXTURE_ROOM_PERCENT = '95'
+    # 8 GB VRAM & RAM residency management: stay under ~7.0 GB WDDM budget & cap 32 GB host RAM
+    VICTORY_RESIDENCY               = '1'
+    VICTORY_CARD_WINDOWS_MB         = '0'
+    VICTORY_CARD_BUFFERS_MIN_MB     = '1'
+    VICTORY_CARD_BUFFERS_MB         = '768'
+    VICTORY_CARD_ROOM_FOR_TARGETS_MB = '1536'
+    VICTORY_TEXTURE_ROOM_PERCENT    = '82'
+    # Keep ON: RELAY=2 stalls boot at ~5 GB; KEEP_SNAPSHOTS=1 keeps boot reliable
+    VICTORY_KEEP_SNAPSHOTS          = '1'
+    VICTORY_LEVELS_ON_DEMAND        = '1'
+    VICTORY_TILES_SMALL_WHEN_FULL_MB = '512'
 
-    # Core VIctory-7900XTX async & relay pipeline (tested baseline from scripts/play.ps1)
-    VICTORY_TEXTURE_NO_WAIT    = '1'
+    # Core VIctory-7900XTX async & relay pipeline (8 GB NVIDIA stability profile from README.md)
+    VICTORY_TEXTURE_NO_WAIT    = '0'
     VICTORY_RELAY              = '2'
     VICTORY_RELAY_COPY         = '1'
     VICTORY_WIDE_BACK          = '1'
     VICTORY_CARD_REHASH_RUNS   = '1'
     VICTORY_JOIN_COPIES        = '1'
-    VICTORY_INDIRECT_WINDOW    = '1'
+    VICTORY_INDIRECT_WINDOW    = '0'
     VICTORY_CARD_STEPS         = '2'
     VICTORY_INDIRECT_BATCH     = '2'
+    VICTORY_QUEUE2             = '1'
+    VICTORY_PIPELINE_WAIT_MS   = '100'
     VICTORY_MAP_THREADS        = '1'
     VICTORY_TITLE_PRIORITIES   = '0'
     VICTORY_CARD_AWAKE         = '1'
@@ -77,14 +85,18 @@ if ($Safe) {
 } else {
     # Multi-threading & CPU ports tuned for Ryzen 5 5600XT (6 physical cores / 12 threads)
     $settings.VICTORY_ASYNC_SUBMIT     = '1'
-    $settings.VICTORY_THIN             = '0'
+    $settings.VICTORY_THIN             = '1'
+    $settings.VICTORY_JOIN_PARTS       = '8'
     $settings.VICTORY_UNDER_THREADS    = '4'
     $settings.VICTORY_VIEW_THREADS     = '4'
     $settings.VICTORY_UPLOAD_AHEAD     = '1'
     $settings.VICTORY_PORT_GUARD       = '1'
     $settings.VICTORY_PORT_JOURNAL     = '1'
-    $settings.VICTORY_SUBMIT_DEPTH     = '8'
-    $settings.VICTORY_SUBMIT_FRAMES    = '0'
+    $settings.VICTORY_LOOKUP_CACHE     = '1'
+    $settings.VICTORY_TABLE_STAGES     = '1'
+    $settings.VICTORY_WAVE64_PAIRED    = '1'
+    $settings.VICTORY_SUBMIT_DEPTH     = '64'
+    $settings.VICTORY_SUBMIT_FRAMES    = '2'
     $settings.VICTORY_LATE_WAIT_LISTS  = '16'
 }
 

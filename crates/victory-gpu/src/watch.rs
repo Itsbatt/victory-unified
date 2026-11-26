@@ -30,6 +30,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, RangeBounds};
 use std::sync::{Condvar, Mutex, RwLock};
 
+#[cfg(feature = "diagnostics")]
+pub(crate) static AHEAD_VIEWS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The unit tracked and copied: 64 KiB, the console's page (the kernel's
 /// 4 KiB pages fold into it). Finer units made the checks of the world's
 /// big buffers cost more than the copies they saved.

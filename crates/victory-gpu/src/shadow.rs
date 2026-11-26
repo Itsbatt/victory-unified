@@ -5706,6 +5706,26 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
 #[allow(clippy::type_complexity)]
 static EXACT: Mutex<(u64, BTreeMap<(u64, u64), (Arc<Shadow>, u64)>)> = Mutex::new((0, BTreeMap::new()));
 
+struct ExactSpare {
+    bucket: u64,
+    buffer: ID3D12Resource,
+    data: *mut u8,
+    gpu: u64,
+    retired_at: u64,
+}
+
+// SAFETY: `ID3D12Resource` is free-threaded and the persistently mapped CPU
+// write-back pointer is untouched while sitting in `EXACT_SPARE` past its
+// retirement submission fence.
+unsafe impl Send for ExactSpare {}
+
+/// Retired exact-view shared buffers waiting for reuse, and their total bytes.
+static EXACT_SPARE: Mutex<(Vec<ExactSpare>, u64)> = Mutex::new((Vec::new(), 0));
+
+fn exact_bucket(len: u64) -> u64 {
+    len.next_multiple_of(4096).next_power_of_two()
+}
+
 /// Since the last frame line: askings for such copies, and copies made.
 static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 
@@ -5726,10 +5746,12 @@ static EXACT_STATS: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
 /// those not asked for lately go once there are many (ring positions
 /// change every frame).
 pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
-    /// Copies kept before the idle ones are looked for, and the askings an
-    /// idle one stays for.
-    const MANY: usize = 256;
-    const LATELY: u64 = 512;
+    /// Copies kept before idle ones are retired, and askings an idle copy stays
+    /// before entering the spare pool (or freeing when host RAM is pressured).
+    const MANY: usize = 2048;
+    const LATELY: u64 = 2048;
+    const MAX_SPARE: usize = 512;
+    const MAX_SPARE_BYTES: u64 = 128 << 20;
     /// The largest, and no view the title made on purpose: off its dwords.
     const MOST: u64 = 64 << 20;
     if len == 0 || len > MOST || !address.is_multiple_of(4) {
@@ -5745,17 +5767,69 @@ pub(crate) fn exact(address: u64, len: u64) -> Option<Arc<Shadow>> {
         shadow.used.store(crate::host::moment(), Ordering::Relaxed);
         return Some(shadow.clone());
     }
-    if map.len() >= MANY {
-        // Held by the map alone (no list), its buffer by the copy alone (no
-        // slot shows it), and not asked for lately.
-        map.retain(|_, (shadow, used)| {
-            Arc::strong_count(shadow) > 1 || crate::host::references(&shadow.buffer) > 1 || *used + LATELY > now
-        });
+    let pressured = crate::residency::pressured();
+    let lately = if pressured { 512 } else { LATELY };
+    let max_spare = if pressured { 256 } else { MAX_SPARE };
+    let max_spare_bytes = if pressured { 64 << 20 } else { MAX_SPARE_BYTES };
+    let mut retired = Vec::new();
+    if pressured || map.len() >= MANY {
+        let mut keep = BTreeMap::new();
+        for (key, (shadow, used)) in std::mem::take(map) {
+            if Arc::strong_count(&shadow) > 1
+                || crate::host::references(&shadow.buffer) > 1
+                || used + lately > now
+            {
+                keep.insert(key, (shadow, used));
+            } else {
+                retired.push((exact_bucket(shadow.len), shadow.buffer.clone(), shadow.data, shadow.gpu));
+                drop(shadow);
+            }
+        }
+        *map = keep;
     }
-    let (buffer, data) = host()?.shared_buffer(len.next_multiple_of(256))?;
-    crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
-    // SAFETY: a live buffer.
-    let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+    let bucket = exact_bucket(len);
+    let (begun, finished) = crate::host::submissions();
+    let reused = {
+        let mut spare = EXACT_SPARE.lock().unwrap_or_else(|e| e.into_inner());
+        for (b, buffer, data, gpu) in retired {
+            if b <= max_spare_bytes {
+                spare.1 += b;
+                spare.0.push(ExactSpare {
+                    bucket: b,
+                    buffer,
+                    data,
+                    gpu,
+                    retired_at: begun,
+                });
+            }
+        }
+        // Keep the spare pool bounded (tighter when host RAM is pressured) without
+        // clearing it outright, so ring-buffer views keep recycling instead of
+        // re-allocating committed `shared_buffer`s.
+        while spare.0.len() > max_spare || spare.1 > max_spare_bytes {
+            let evicted = spare.0.remove(0);
+            spare.1 = spare.1.saturating_sub(evicted.bucket);
+        }
+        spare
+            .0
+            .iter()
+            .rposition(|e| e.bucket == bucket && e.retired_at <= finished)
+            .map(|i| {
+                let entry = spare.0.remove(i);
+                spare.1 = spare.1.saturating_sub(entry.bucket);
+                (entry.buffer, entry.data, entry.gpu)
+            })
+    };
+    let (buffer, data, gpu) = match reused {
+        Some(hit) => hit,
+        None => {
+            let (buffer, data) = host()?.shared_buffer(bucket)?;
+            crate::host::name(&buffer, || format!("title view {address:#x}+{len:#x}"));
+            // SAFETY: a live buffer.
+            let gpu = unsafe { buffer.GetGPUVirtualAddress() };
+            (buffer, data, gpu)
+        }
+    };
     let shadow = Arc::new(Shadow::new(buffer, data, gpu, address, len));
     map.insert((address, len), (shadow.clone(), now));
     EXACT_STATS[1].fetch_add(1, Ordering::Relaxed);
@@ -5985,6 +6059,17 @@ mod window_tests {
         assert!(after_unreg > after_reg);
         // No host device in unit test, so `found` must still return None cleanly without panicking.
         assert!(super::found(dummy_key.0, 64, false).is_none());
+    }
+
+    #[test]
+    fn exact_bucket_rounds_to_4k_powers_of_two() {
+        assert_eq!(super::exact_bucket(1), 4096);
+        assert_eq!(super::exact_bucket(256), 4096);
+        assert_eq!(super::exact_bucket(4096), 4096);
+        assert_eq!(super::exact_bucket(4097), 8192);
+        assert_eq!(super::exact_bucket(65_536), 65_536);
+        assert_eq!(super::exact_bucket(65_537), 131_072);
+        assert_eq!(super::exact_bucket(64 << 20), 64 << 20);
     }
 }
 

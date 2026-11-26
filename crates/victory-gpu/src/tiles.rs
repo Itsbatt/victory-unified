@@ -71,6 +71,11 @@ const HEAP_TILES: u32 = 1024;
 /// no heap could be had); uploads recorded again for such a level.
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
+/// Bytes of tiles currently given via [`Tiled::small_levels`] while the card
+/// lacked room (`VICTORY_TILES_SMALL_WHEN_FULL_MB`). Tracked independently of
+/// total tiled bytes (`STATS[2]`) so large textures do not exhaust the budget.
+static SMALL_GIVEN: AtomicU64 = AtomicU64::new(0);
+
 /// `VICTORY_TILES_SMALL_WHEN_FULL_MB` (default `512` on <=8 GiB VRAM adapters,
 /// `0` otherwise; `0` disables): while the card has no room, an upload still
 /// gives tiles to the smallest held levels of its texture so textures never
@@ -288,6 +293,8 @@ pub(crate) struct Tiled {
     /// The levels a recorded list of the card's own writes has already
     /// written with zeros first ([`Tiled::claim`]).
     claimed: AtomicU32,
+    /// Bytes of tiles given via [`Self::small_levels`] fallback (counted in [`SMALL_GIVEN`]).
+    small_bytes: AtomicU64,
 }
 
 impl Tiled {
@@ -354,6 +361,7 @@ impl Tiled {
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            small_bytes: AtomicU64::new(0),
         })
     }
 
@@ -398,7 +406,15 @@ impl Tiled {
         // On a full card, with `VICTORY_TILES_SMALL_WHEN_FULL_MB`, the
         // smallest held levels too: this list writes every level whole.
         let small = if room { 0 } else { self.small_levels(held) };
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card | small });
+        let changed = self.give_locked(
+            &mut given,
+            queue,
+            device,
+            texture,
+            named,
+            if room { named } else { card | small },
+            if room { 0 } else { small & !card },
+        );
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
     }
@@ -435,6 +451,7 @@ impl Tiled {
             texture,
             prev | levels | self.held.load(Ordering::Relaxed),
             levels,
+            0,
         );
         // Only levels that actually received tiles (or already had them) saw
         // the card's write; a level that got no tiles saw its zeros and write
@@ -454,7 +471,7 @@ impl Tiled {
     /// ([`small_when_full_mb`]) so textures remain visible instead of disappearing.
     fn small_levels(&self, held: u32) -> u32 {
         let cap = small_when_full_mb() << 20;
-        if cap == 0 || STATS[2].load(Ordering::Relaxed) >= cap {
+        if cap == 0 || SMALL_GIVEN.load(Ordering::Relaxed) >= cap {
             return 0;
         }
         let first_packed = self.standard.len() as u32;
@@ -553,7 +570,7 @@ impl Tiled {
         may: u32,
     ) -> bool {
         let mut given = self.given.lock().unwrap_or_else(|e| e.into_inner());
-        self.give_locked(&mut given, queue, device, texture, named, may)
+        self.give_locked(&mut given, queue, device, texture, named, may, 0)
     }
 
     fn give_locked(
@@ -564,6 +581,7 @@ impl Tiled {
         texture: &ID3D12Resource,
         named: u32,
         may: u32,
+        small_bits: u32,
     ) -> bool {
         let has = |level: u32| level < 32 && named & (1 << level) != 0;
         let now = |level: u32| level < 32 && named & may & (1 << level) != 0;
@@ -625,8 +643,17 @@ impl Tiled {
             for &(start, count) in &runs {
                 given.runs.push((index, start, count));
             }
-            STATS[2].fetch_add(u64::from(tiles) * TILE, Ordering::Relaxed);
+            let added = u64::from(tiles) * TILE;
+            STATS[2].fetch_add(added, Ordering::Relaxed);
             STATS[5].fetch_add(1, Ordering::Relaxed);
+            let is_small = match level {
+                Some(l) => l < 32 && small_bits & (1 << l) != 0,
+                None => first_packed < 32 && (small_bits >> first_packed) != 0,
+            };
+            if is_small {
+                self.small_bytes.fetch_add(added, Ordering::Relaxed);
+                SMALL_GIVEN.fetch_add(added, Ordering::Relaxed);
+            }
         }
         let with_tiles = |level: u32| {
             if level < first_packed {
@@ -691,6 +718,10 @@ impl Drop for Tiled {
         STATS[0].fetch_sub(1, Ordering::Relaxed);
         STATS[1].fetch_sub(self.full, Ordering::Relaxed);
         STATS[2].fetch_sub(bytes, Ordering::Relaxed);
+        let small = *self.small_bytes.get_mut();
+        if small != 0 {
+            SMALL_GIVEN.fetch_sub(small, Ordering::Relaxed);
+        }
     }
 }
 
@@ -1618,6 +1649,7 @@ void look() {
             held: AtomicU32::new(0),
             card: AtomicU32::new(0),
             claimed: AtomicU32::new(0),
+            small_bytes: AtomicU64::new(0),
         };
         assert_eq!(tiled.claim(1 << 0), 1 << 0);
         let changed = tiled.card_wrote_on(host.queue(), &host.device, &tex, 1 << 0);
@@ -1632,5 +1664,34 @@ void look() {
         assert!(!changed && waiting);
         assert!(!tiled.has_tiles(0));
         assert_eq!(tiled.given_bytes(), 0);
+    }
+
+    #[test]
+    fn small_levels_budget_is_independent_of_total_tiled_bytes() {
+        let prev_total = STATS[2].swap(1024 << 20, Ordering::Relaxed);
+        let tiled = Tiled {
+            standard: vec![32, 1],
+            packed: 0,
+            levels: 2,
+            full: 33 * TILE,
+            given: Mutex::new(Given {
+                levels: vec![false, false],
+                packed: false,
+                runs: Vec::new(),
+            }),
+            shown: AtomicU32::new(u32::MAX),
+            held: AtomicU32::new(0),
+            card: AtomicU32::new(0),
+            claimed: AtomicU32::new(0),
+            small_bytes: AtomicU64::new(0),
+        };
+        let cap = small_when_full_mb() << 20;
+        if cap > 0 {
+            assert_eq!(tiled.small_levels(0b11), 1 << 1);
+            let prev_small = SMALL_GIVEN.swap(cap, Ordering::Relaxed);
+            assert_eq!(tiled.small_levels(0b11), 0);
+            SMALL_GIVEN.store(prev_small, Ordering::Relaxed);
+        }
+        STATS[2].store(prev_total, Ordering::Relaxed);
     }
 }

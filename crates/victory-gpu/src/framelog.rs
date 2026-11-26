@@ -346,10 +346,10 @@ fn sample() -> [u64; S] {
         pk,
         page_faults(),
         crate::draw::drawn(),
-        crate::pipeline::frame_log_counts().0,
-        crate::pipeline::frame_log_counts().1,
-        crate::texture::SPARE_STATS[0].load(Relaxed),
-        crate::texture::SPARE_STATS[1].load(Relaxed),
+        0,
+        0,
+        0,
+        0,
         free_mb(),
     ]
 }
@@ -535,7 +535,6 @@ pub fn frame() {
     if !on() {
         return;
     }
-    crate::cardmeter::collect();
     add(T::RenderLooks, 1);
     if on_slow_core() {
         add(T::RenderSlow, 1);

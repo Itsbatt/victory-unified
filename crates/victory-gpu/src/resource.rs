@@ -1771,6 +1771,16 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
 /// their room kept, the queue stops that much earlier while the world
 /// loads and gets it back as the targets are made.
 #[cfg(windows)]
+fn default_targets_room_mb(local_vram_budget: Option<u64>) -> u64 {
+    // 8 GB GPUs (~7 GiB WDDM budget) use ~1.3-1.5 GiB for render targets at 1080p;
+    // reserving 3 GiB phantom-locks VRAM needed by streamed textures.
+    if local_vram_budget.is_some_and(|b| b <= (10u64 << 30)) {
+        1536
+    } else {
+        3072
+    }
+}
+
 pub(crate) fn targets_room_kept() -> u64 {
     use std::sync::atomic::Ordering::Relaxed;
     static MOST: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -1778,7 +1788,13 @@ pub(crate) fn targets_room_kept() -> u64 {
         std::env::var("VICTORY_CARD_ROOM_FOR_TARGETS_MB")
             .ok()
             .and_then(|v| v.trim().parse::<u64>().ok())
-            .map_or(3072 << 20, |mb| mb.min(8192) << 20)
+            .unwrap_or_else(|| {
+                let vram_budget =
+                    crate::host::host().and_then(|h| h.video_memory()).map(|[b, ..]| b);
+                default_targets_room_mb(vram_budget)
+            })
+            .min(8192)
+            << 20
     });
     // Every host texture's bytes less those of the copies the title fills.
     let targets = HOST_TEXTURES[1].load(Relaxed).saturating_sub(KINDS[1].load(Relaxed));
@@ -2534,7 +2550,8 @@ fn host_texture_as(
     // A texture the title fills, whose every subresource is uploaded before
     // anything reads it: cut from a block (what the piece held before shows
     // in no texel).
-    if fills(desc)
+    if !reserved
+        && fills(desc)
         && d.sample_count <= 1
         && clear_value.is_none()
         && texture_layout(desc).is_some_and(|t| !t.planes[0].layout.desc.swizzle.xor())
@@ -4598,6 +4615,59 @@ float4 lit() : SV_Target { return 1.0; }
         assert_eq!(texture_floor_bytes(Some(12 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(24 * GIB)), 2 * GIB);
         assert_eq!(texture_floor_bytes(Some(32 * GIB)), 2 * GIB);
+    }
+
+    #[test]
+    fn default_targets_room_scales_with_local_vram_budget() {
+        const GIB: u64 = 1 << 30;
+        assert_eq!(default_targets_room_mb(None), 3072);
+        assert_eq!(default_targets_room_mb(Some(7 * GIB)), 1536);
+        assert_eq!(default_targets_room_mb(Some(8 * GIB)), 1536);
+        assert_eq!(default_targets_room_mb(Some(10 * GIB)), 1536);
+        assert_eq!(default_targets_room_mb(Some(12 * GIB)), 3072);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn mid_list_depth_plane_use_flushes_immediately() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        const DEPTH_WRITE: u32 = 0x10;
+        let desc = ResourceDesc {
+            flags: 6,
+            ..texture(4, 4, 118, 1)
+        };
+        let mut depth = std::ptr::null();
+        assert_eq!(
+            create_committed(
+                std::ptr::null(),
+                &PROPERTIES,
+                0,
+                &desc,
+                DEPTH_WRITE,
+                std::ptr::null::<std::ffi::c_void>().cast(),
+                &RESOURCE_IIDS[0],
+                &mut depth,
+            ),
+            S_OK
+        );
+        if twin_plane_resource(depth).is_none() {
+            return;
+        }
+        let before_skipped = PLANES[2].load(Relaxed);
+        let list = host.new_list().unwrap();
+        assert!(list.twin_use(depth, true, true));
+        list.twins_written();
+        assert!(!list.has_plane_clobbered());
+        assert!(list.twin_use(depth, false, false));
+        assert!(list.has_plane_clobbered(), "mid-list depth use must flush pass_plane immediately");
+        assert!(list.take_plane_clobbered());
+        assert!(!list.has_plane_clobbered());
+        assert_eq!(PLANES[2].load(Relaxed), before_skipped, "must not defer mid-list plane flush");
+        list.close();
+        host.execute(&[&list]);
     }
 
     /// A placed texture viewed from a later level has a host copy of that

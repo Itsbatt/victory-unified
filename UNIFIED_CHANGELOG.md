@@ -13,6 +13,10 @@ Licensed under **GPL-3.0-or-later** (see `LICENSE` and `docs/asset-policy.md`).
    - BC7 channel rotation fix (modes 4 and 5 only, upstream PR #3111) in `crates/victory-formats/src/bcpack.rs`
    - Legacy multiply-add (`v_mac_legacy_f32` / `v_mad_legacy_f32`) with `ftz` and `legacy_fmad` (PR #1026) in `crates/victory-shader/src/emit/lower.rs`
    - `VICTORY_SETTLE_ROOM=1` (2x flights in air, 8x changed runs merged) in `crates/victory-gpu/src/host.rs`
-4. **[stellarr-studio/kelvaroq](https://github.com/stellarr-studio/kelvaroq)** — Hardware profiling & 8 GB VRAM budget tuning:
-   - `VICTORY_TEXTURE_STAGE_MB=64`, `VICTORY_CARD_BUFFERS_MB=256`, `VICTORY_QUEUE2_LANDING_MB=32`
+   - Thread-local buffer & loose-window lookup cache (`VICTORY_LOOKUP_CACHE=1` / `VICTORY_QUICK_FIND`, PR #1237 + PR #1245 ordering) in `crates/victory-gpu/src/shadow.rs` & `host.rs`
+   - Cross-stage dynamic descriptor table sharing (`VICTORY_TABLE_STAGES=1`, PR #1146 / `5d659e0`) plus cross-draw prefix reuse (`fresh_by_table`) in `crates/victory-gpu/src/draw.rs`
+   - `VICTORY_TILES_SMALL_WHEN_FULL_MB=512` (`f6a09d3`) in `crates/victory-gpu/src/tiles.rs` & `exact()` view-copy cache expansion (`MANY=4096, LATELY=16384`) in `crates/victory-gpu/src/shadow.rs`
+4. **[stellarr-studio/kelvaroq](https://github.com/stellarr-studio/kelvaroq)** — Hardware profiling, Wave64 paired compute & 8 GB VRAM budget tuning:
+   - `VICTORY_TEXTURE_STAGE_MB=64`, `VICTORY_CARD_BUFFERS_MB=512`, `VICTORY_QUEUE2_LANDING_MB=32`, `VICTORY_LEVELS_ON_DEMAND=1`
+   - Wave64 paired compute lowering (`VICTORY_WAVE64_PAIRED=1`, `0052-wave64.patch`) in `crates/victory-shader/src/emit/bitcode/paired.rs`, `lower.rs`, `mod.rs` with automatic Wave64 cache refresh in `crates/victory-gpu/src/shader_cache.rs`
 5. **[DexNom/VIctory](https://github.com/DexNom/VIctory)** — Shader/DXIL correctness fixes (quad neighbor sampling, cube-map explicit gradients, DXC vertex signature ordering, sparse texture range merging — already integrated in the `VIctory-7900XTX` base).
