@@ -131,6 +131,12 @@ pub(crate) enum C {
     WaitsForGroups,
     WaitsForBuffers,
     IndirectBounded,
+    /// `watch::writes` kernel askings that failed (the range is not
+    /// write-watched: view memory or not watchable).
+    WatchFailed,
+    /// `watch::writes` askings not made because the range's first block is
+    /// already known to be guarded view memory (no kernel call).
+    WatchKnownView,
 }
 const COUNTERS: usize = 80;
 /// One of some sets of counters, each in lines of the processor's memory of
@@ -1152,6 +1158,9 @@ pub(crate) fn recorded(started: std::time::Instant) {
     crate::timeline::called(took);
     add(C::RecordCalls, 1);
     add(C::RecordNs, ns);
+    crate::framelog::add(crate::framelog::T::RecordCalls, 1);
+    crate::framelog::add(crate::framelog::T::RecordNs, ns);
+    crate::framelog::here(crate::framelog::H::RecordNs, ns);
     if !RECORDED_SINCE.load(Relaxed) && !RECORDED_SINCE.swap(true, Relaxed) {
         let began = now_us().saturating_sub(ns / 1000);
         add(C::UntilRecordUs, began.saturating_sub(PRESENTED_AT.load(Relaxed)));
@@ -1165,6 +1174,12 @@ pub(crate) fn recorded(started: std::time::Instant) {
         return;
     }
     UNSENT.with(|u| u.set((0, 0)));
+    if crate::framelog::on() {
+        crate::framelog::add(crate::framelog::T::RecordLooks, 1);
+        if crate::framelog::on_slow_core() {
+            crate::framelog::add(crate::framelog::T::RecordSlow, 1);
+        }
+    }
     let id = thread_id();
     let mut all = RECORDERS.lock().unwrap_or_else(|e| e.into_inner());
     match all.iter_mut().find(|r| r.0 == id) {
@@ -1499,6 +1514,14 @@ pub(crate) fn log(frames: f64) {
             longest as f64 / 1e3
         );
     }
+    tracing::info!(
+        "  write-watch askings per frame that failed in the kernel: {:.0}; not made because the range \
+         is known guarded view memory: {:.0} (VICTORY_VIEW_ASK=1 asks the kernel anyway); such ranges left \
+         out of the submissions' askings ahead: {:.0}",
+        c[C::WatchFailed as usize],
+        c[C::WatchKnownView as usize],
+        crate::watch::AHEAD_VIEWS.swap(0, Relaxed) as f64 / frames,
+    );
     tracing::info!(
         "  waits for every earlier shader write, per frame: {:.0} for the title's barrier groups, {:.0} \
          for its barriers on buffers; {:.0} indirect commands bounded (a dispatch of ours between two \

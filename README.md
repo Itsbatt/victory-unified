@@ -1,155 +1,214 @@
-# VIctory on an RX 7900 XTX
+# victory-unified
 
-A fork of [VIctory](https://github.com/Marvisak/VIctory), a compatibility layer
-that runs an Xbox Series title natively on Windows from files the user supplies.
+A unified fork by **[Itsbatt](https://github.com/Itsbatt)** (built and tuned with
+**Antigravity / Google Deepmind AI** and **Kilo**) that brings together the latest
+performance, shader/pipeline, and rendering work from
+**[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**,
+**[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**,
+**[DexNom/VIctory](https://github.com/DexNom/VIctory)**,
+**[Zettrox/ztrx](https://github.com/Zettrox/ztrx)** and the renderer-port line of
+**[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)**,
+all on top of **[Marvisak/VIctory](https://github.com/Marvisak/VIctory)**, and
+tuned for an **NVIDIA RTX 3070 8 GB** on a 32 GB host.
 
-## The goal
+**This repository contains no game files, code or assets.** You need your own copy
+of the game. It is not affiliated with or endorsed by the game's developer or
+publisher.
 
-**A stable 30 fps or more without ray tracing, then as high a frame rate and as
-low frame times as the PC allows**, on an AMD RX 7900 XTX first and on PCs with
-32 GB (later 16 GB) of RAM.
+## What this unified fork adds
 
-The way there is **porting, not emulating**: patching the title's renderer so it
-behaves the way a PC renderer does, rather than having the layer watch and copy
-the console's shared memory every frame. Shaders are translated ahead of time
-into a versioned store that is kept between builds. Ray tracing stays optional
-and off by default. The picture comes after the frame rate: texture pop-in and
-lighting that is too bright or too dark when walking indoors are next in line.
+### Graphics & lighting
 
-**This repository contains no game files, code or assets.** You need your own
-copy of the game. It is not affiliated with or endorsed by the game's developer
-or publisher.
+- **Indirect diffuse / ambient light** (`crates/victory-gpu/src/ambient.rs`,
+  `VICTORY_AMBIENT=1.25`): built on `Belobug/VIctory-Belobug-AMD` (`4f45ab8`) with a
+  higher `1.25` diffuse floor and a subtle hemispherical sky-to-ground tint (`±8%`)
+  so daylight outdoor shadows (foliage, terrain, buildings, character clothes) keep
+  readable color and depth without overexposing interiors.
+- **Helper-lane quad reads** (`crates/victory-shader/src/emit/lower.rs`): ported from
+  `Belobug/VIctory-Belobug-AMD` (`03629f3`) and extended with `DexNom/VIctory`
+  (`921d8d3`) fast quad intrinsics (`quadReadLaneAt`/`quadOp`) and quad-local `DPP8`
+  support, so pixel-shader quad operations preserve helper pixels and triangle edges
+  no longer show lines on car paint, glass, and skin.
+- **Shader, cubemap & PSO fixes ported from `DexNom/VIctory`** (`ddb7332`, `76749ce`,
+  `5f4c3df`, `921d8d3`): uniform branching across immediate static samplers
+  (`lower.rs`, +40 shader variants); restored `wave64` scalar-copy lane mask
+  recognition (`structure.rs`); vertex output signature ordering by name offset,
+  declared PSV interpolation, and matching unused packed PS inputs (`container.rs`,
+  `emit/mod.rs`, `shader.rs`); cube-map explicit-gradient LOD fix and `CalculateLOD`
+  spatial fix (`lower.rs`); integer render-target blend bypass on mixed MRTs
+  (`pipeline/host.rs`, `pipeline.rs`); and depth-only pipeline pre-warming priority
+  (`pipeline/make.rs`).
+- **Full `fxceless/victory-fork` rendering base** (`0b0074e`): depth bounds test
+  (`#82`), character bake/skin/hair texture rechecking (`VICTORY_HEAP_RECHECK`),
+  first-room descriptor mirroring, `VICTORY_LEVELS_ON_DEMAND=1`, and 59/64 trace
+  programs.
+- **Renderer ports 1, 2, 5, 6, 7** from `avatarmanz/VIctory-7900XTX` (off by default
+  while tested): `VICTORY_PORT_CONSTANTS`, `VICTORY_PORT_DESCRIPTORS`,
+  `VICTORY_PORT_CBV`, `VICTORY_PORT_GUARD`, `VICTORY_PORT_JOURNAL` — reading the
+  title's constants/descriptors in place, translating constant buffers to raw bytes,
+  sharing the write-guard lock, and splitting the journal into 64 locked parts.
+
+### Performance, stability & input
+
+- **Hoisted indirect draw clamps** (`indirect.rs`, `draw.rs`, `host.rs`, `list.rs`,
+  opt-in `VICTORY_HOIST_CLAMPS=7`): ported from `Belobug/VIctory-Belobug-AMD`
+  (`ccab973`, `afca189`, `918ab03`, `76387c2`). Defaults to `0` (inline clamps) on
+  NVIDIA `late` queues to avoid per-frame list-split stalls.
+- **Texture streaming & memory-range locking** (`watch.rs`, `xmem.rs`, `texture.rs`,
+  `descriptor/host.rs`): ported from `DexNom/VIctory` (`5f4c3df`, `921d8d3`).
+  Per-range locks replace the global `MAPPING` lock so DirectStorage remaps do not
+  block unrelated texture uploads; `O(1)` unmapped fast-path rejection in
+  `mapped_bytes` avoids kernel `VirtualQuery` contention; retries alternate with
+  fresh textures; full remap queues are not dropped.
+- **Safe descriptor lifetime** (`crates/victory-gpu/src/descriptor/host.rs`): defers
+  live shader-visible descriptor `unmake` / view-remake writes while GPU submissions
+  are in flight (`crate::host::flying()`), flushing them in `Host::sweep()`
+  (`flush_idle_heaps()`) once the GPU is idle. This is the fix that ended the
+  recurring `nvlddmkm` `MMU Fault` crashes (see status below).
+- **Tuned RTX 3070 8 GB launcher** (`scripts/play.ps1`, `Play-GTA6-RTX3070.ps1`):
+  `VICTORY_DISPLAY_MODE=1920x1080`, `VICTORY_ASYNC_SUBMIT=1`, `VICTORY_QUEUE2=1`,
+  `VICTORY_CARD_BUFFERS_MB=768`, `VICTORY_TEXTURE_BUDGET_MB=2560`,
+  `VICTORY_PIPELINE_WAIT_MS=100`, while keeping `VICTORY_INDIRECT_WINDOW`,
+  `VICTORY_HOIST_CLAMPS`, `VICTORY_TEXTURE_NO_WAIT` and `VICTORY_INPLACE` off for
+  8 GB NVIDIA stability.
+- **30 FPS frame cap** (`VICTORY_MAX_FPS=30` in `crates/victory-gpu/src/queue.rs`):
+  caps menus/loading screens cleanly at 30 FPS.
+- **Lower commit memory** (`crates/victory-gpu/src/shadow.rs`): caps the idle
+  snapshot pool at `64 MiB` and drains it on tight commit memory before retrying.
+- **Keyboard + XInput pad support**
+  (`crates/victory-hle/src/modules/gameinput.rs`): maps `Space` alongside `Enter`
+  to `A`, and keeps keyboard fallback active on slot `0` while focused even when a
+  physical or virtual XInput controller (e.g. DS4Windows) is connected.
+- **Paired bitcode emission** (`crates/victory-shader/src/emit/bitcode/paired.rs`,
+  `paired_tests.rs`): paired-bitcode emission path for translated shaders.
 
 ## Where it stands (2026-11-26)
 
-Tested on one machine only: Windows 11, Intel i9-12900K, 64 GB RAM, Radeon
-RX 7900 XTX, ray tracing off.
+Tested on two machines only.
+
+**Primary dev machine** — Windows 11, Intel i9-12900K, 64 GB RAM, Radeon RX 7900 XTX,
+ray tracing off:
 
 | | |
 |---|---|
-| City street, Series S profile, renderer patches 1, 2, 5, 6 and 7 on | about 45 ms a frame (about 22 fps, 44.9 ms in run merge-5) |
-| Same, patches 1, 2, 5 and 6 | 45.6 ms, p95 47 ms |
-| Same, patches 1, 2 and 5 | 47.3 ms (about 21 fps), p95 49 ms |
-| Series X profile, patches 1+2 | about 53 ms (about 19 fps) |
-| Same scene before the patches | 57-75 ms (13-17 fps) |
+| City street, Series S profile, renderer ports 1, 2, 5, 6 and 7 on | about 45 ms a frame (about 22 fps, 44.9 ms in run merge-5) |
+| Same, ports 1, 2, 5 and 6 | 45.6 ms, p95 47 ms |
+| Same, ports 1, 2 and 5 | 47.3 ms (about 21 fps), p95 49 ms |
+| Series X profile, ports 1+2 | about 53 ms (about 19 fps) |
+| Same scene before the ports | 57–75 ms (13–17 fps) |
 | Shaders the title uses that translate | all of them (25,790 of 25,985; the rest are unused geometry shaders) |
-| Memory | about 30 GB of private memory, 10.5 GB of VRAM: **64 GB of RAM recommended** for now |
+| Memory | about 30 GB private, 10.5 GB VRAM: **64 GB RAM recommended** on this GPU |
 
-It started at 280 ms a frame in the same scenes three days earlier. What sets
-the frame now is the one thread that submits the title's work to the card
-(about 40 ms); the card itself needs about 36 ms and now waits about 7 ms a frame with nothing queued.
+**Test machine for the unified RTX 3070 build** — Windows 11 Pro (`10.0.26300`), Ryzen
+5 5600XT (6c/12t), NVIDIA RTX 3070 8 GB (driver `32.0.16.2114`), 32 GB RAM,
+47.93 GB commit, Xbox Series X profile:
 
-### Renderer patches (off by default while they are tested)
-
-| Switch | What it does |
+| Area | Verified result |
 |---|---|
-| `VICTORY_PORT_CONSTANTS=1` | The title's 174 MB constants heap is read by the card where the title writes it: no uploads, no fills |
-| `VICTORY_PORT_DESCRIPTORS=1` | The title's descriptor-table stores are patched (byte-checked) to report the slots they write, instead of a scan of ~600,000 slots a frame |
-| `VICTORY_PORT_CBV=1` | Translated shaders read constant buffers in place as raw bytes (~22,000 fills a frame to none; -4.7 ms) |
-| `VICTORY_PORT_GUARD=1` | The write guards' lock is shared by faults and refreshes, with a claim per 64 KiB block; the submission's planning runs beside it (title threads' waits 29 ms to ~2 ms a frame; -2 ms) |
-| `VICTORY_PORT_JOURNAL=1` | The heaps' records are asked for at the title's submit, and the journal's notes are split into 64 parts with locks of their own (the submit thread's waits ~5 ms + 1 ms to ~0.3 ms; -1 to -3 ms) |
+| Boot, menus, start screen | Works; capped at 30 fps; `Enter` / `Space` mapped to `A` |
+| Progression reached | Advances past menus, opening intro, first room, into gameplay (`Player` + `SARC0015` autosave reached; ambient light active) |
+| Frame time & utilization | ~2–3 fps in the open world; `344.0 ms/frame` at `8,011 draws/frame`; `425 ms` on a heavy `9,940`-draw frame under `diag` (77% GPU busy) |
+| Memory footprint | `19.66–20.51 GB` commit / `15.13–15.40 GB` active RAM in-world |
 
-### Other switches
+### Longest crash-free session
 
-| Switch | What it does |
-|---|---|
-| `--console series-s` | The Series S profile: 1080p output, about 5 ms faster, a softer picture |
-| `VICTORY_OUTPUT=1920x1080` | The title renders to that output size itself (Series X profile; about 16 ms less card time) |
-| `VICTORY_FRAME_INTERVAL_MS=16.667` | Lets the title go above 30 fps (menus and videos reach 60; the game's clock stays right) |
-| `VICTORY_AMBIENT_SETTLE` | How fast light settles after walking indoors (on by default, `250,3`; `0` turns it off) |
-| `VICTORY_TEXTURE_STORE=1` | Converted textures kept between runs (about 8 ms a frame for now: off) |
+After fixing in-flight descriptor mutation (`768735a` / `flush_idle_heaps()`), the
+longest continuous run reached **~58 minutes with zero crashes**
+(`19:28:28Z` → `20:25:50Z`), ending in the outdoor camp mission
+(`8,011 draws/frame`, `3 fps` at `344.0 ms/frame`).
 
-What is known to be wrong:
+Earlier runs, before that fix, crashed with `nvlddmkm` **Event ID 13 `MMU Fault`**
+(`0xf812b60` / `0x1104`, `0x887A0006`) after **49m 42s** and **49m 47s**
+(`18:49:15` → `19:39:02`). The descriptor-lifetime fix above is what extended the
+stable window from ~49 minutes to ~58 minutes and removed the crash in those runs.
+
+### Known incompatibilities on the RTX 3070
+
+- `VICTORY_ASYNC_PRESENT=1` crashed in `nvwgf2umx.dll` (kept off).
+- `--console series-s` hit `0x887A0001` in `FFX_FSR4` (Series X profile used).
+
+### Known issues
 
 - Trees, signs and far objects flicker in the distance in some places.
-- Lighting is too bright or too dark after walking indoors, until the title has
-  run for a while; rooms with little direct light are too dark without `-RayTracing`.
+- Lighting is too bright or too dark after walking indoors until the title has run
+  for a while; rooms with little direct light are too dark without `-RayTracing`.
 - Textures of what just came into view appear late while the title streams.
 - The first run of a new build stutters while the driver makes pipelines
   (`victory warm` makes them ahead).
 - Recording a frame in the world makes the title's own watchdog end it.
 
-## How to run it
-
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader
-model 6.6 and mesh shaders, Rust (the toolchain is pinned), the MSVC build
-tools, and your own dump of the title.
+## Quick play
 
 ```powershell
-git clone https://github.com/avatarmanz/VIctory-7900XTX
-cd VIctory-7900XTX
-copy victory.example.toml victory.toml      # then set your paths, outside this folder
-cargo build --locked --profile diag -p victory --features diagnostics
-scripts\play.ps1 -Exe <path of your copy's executable>
+cargo build --release -p victory
+powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game folder>\<the game's exe>"
 ```
 
-`scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it first when
-something is wrong. `-RayTracing` turns the title's ray-traced indirect light on.
+You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model 6.6
+and mesh shaders, Rust (the toolchain is pinned), the MSVC build tools, and your own
+dump of the title. `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it
+first when something is wrong. `-RayTracing` turns the title's ray-traced indirect
+light on.
 
-On a hybrid-graphics PC, the runtime and offline pipeline checks prefer a
-high-performance adapter with Shader Model 6.6. The runtime logs its adapter
-name, PCI vendor and device IDs, and dedicated VRAM. Set
-`VICTORY_D3D12_ADAPTER` to a zero-based DXGI index or part of the adapter's
-name to select it explicitly. With the launcher, pass
-`-More @{VICTORY_D3D12_ADAPTER='NVIDIA'}`.
-
-Before the first run, ahead of time (both can be stopped and go on later):
+Before the first run, ahead of time (both can be stopped and resumed later):
 
 ```powershell
 target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
-target\diag\victory.exe warm --used                     # pipelines earlier runs drew with, for a new driver or build
+target\diag\victory.exe warm --used                     # pipelines earlier runs drew with
 ```
 
-Commands, debugging switches and upstream's own description:
-[docs/README-fxceless.md](docs/README-fxceless.md). Every `VICTORY_...` switch is
-described in a comment where it is read.
-
-## What is different here
-
-In short; the reasons and the measurements are in [docs/findings.md](docs/findings.md).
-
-- **List calls are written down, not carried out, on the title's threads**
-  (`VICTORY_THIN`): eight threads of ours translate them.
-- **Submissions are prepared by a thread of ours and joined**
-  (`VICTORY_ASYNC_SUBMIT`, `VICTORY_JOIN_PARTS`), with what can be spread over
-  threads spread: refreshes, compares (AVX2), descriptor records, landings.
-- **What shaders wrote comes back beside the write guards**, by the dwords that
-  changed, on a thread of its own (`VICTORY_RELAY`, `VICTORY_LAND`).
-- **Buffer fills that need bytes still on the card are done on the card**
-  (`VICTORY_CARD_STEPS`) instead of waiting for it.
-- **The title's writes are caught more cheaply**: one view opened at a fault,
-  blocks that rest, places in the title's code that look before they write.
-- **Textures go up on a copy queue of their own** and a slot shows one only after
-  its upload ran, which also ended a device loss that came every 15 minutes or so.
-- **Boats float**: textures that shaders write and the title's CPU reads go back
-  to title memory (from fxceless and Geckomacabre, on by default here).
-- **Frame record and replay** with per-pass times and shader variants compared
-  turn by turn ([docs/replay.md](docs/replay.md)).
+Every `VICTORY_...` switch is described in a comment where it is read; upstream's own
+description is in [docs/README-fxceless.md](docs/README-fxceless.md).
 
 ## Credits
 
 This is a tree of other people's work with more on top. The history is kept, and
 commits taken from elsewhere name the commit and its author.
 
-- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its
-  contributors: the loader, the runtime services, the Direct3D 12 back end and
-  the shader recompiler.
-- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)**: the fork
-  this one started from, and the people whose pull requests it carries.
-- **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: ray tracing fixes,
-  cube gradients, sparse textures.
-- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**:
-  the ambient light idea, pipeline workers, and work by romainhedouin.
+- **[VIctory](https://github.com/Marvisak/VIctory)** by Marvisak and its contributors
+  (GPL-3.0-or-later) is the base of everything here: the loader, the runtime
+  services, the Direct3D 12 back end and the shader recompiler.
+- **[avatarmanz/VIctory-7900XTX](https://github.com/avatarmanz/VIctory-7900XTX)** —
+  primary codebase for the renderer-port line (ports 1, 2, 5, 6, 7), async
+  submission, thin command recording, parallel joins, relay/landing, native
+  resolution scaling, unlocked frame pacing, persistent texture store and the
+  dynamic surface-light ambient stand-in.
+- **[fxceless/victory-fork](https://github.com/fxceless/victory-fork)** (`0b0074e`)
+  — async submission/copy queue, plain-copy path, fast descriptor sync, depth bounds
+  test (`#82`), trace shader translation, character texture recheck,
+  `VICTORY_LEVELS_ON_DEMAND`, BC7 channel rotation fix (modes 4/5, PR #3111), legacy
+  multiply-add (`v_mac_legacy_f32` / `v_mad_legacy_f32`, PR #1026) and
+  `VICTORY_SETTLE_ROOM`.
+- **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**
+  (`4f45ab8`, `03629f3`, `ccab973`, `afca189`, `918ab03`, `76387c2`) — indirect
+  ambient light pass (`ambient.rs` / `VICTORY_AMBIENT`), pixel-shader helper-lane quad
+  reads, hoisted indirect-draw clamps (`VICTORY_HOIST_CLAMPS`), pipeline workers, and
+  work by romainhedouin.
+- **[DexNom/VIctory](https://github.com/DexNom/VIctory)** (`ddb7332`, `76749ce`,
+  `5f4c3df`, `921d8d3`) — uniform static-sampler branching, `wave64` scalar-copy mask
+  recovery, vertex signature order & interpolation validation fixes, cubemap
+  explicit-LOD & `CalculateLOD` fixes, quad-op/DPP8 improvements, integer-target
+  blend bypass, depth-only PSO pre-warming priority, and sparse texture range merging.
+- **[Zettrox/ztrx](https://github.com/Zettrox/ztrx)** — streamlined Windows play
+  script structure and defaults.
+- **[stellarr-studio/kelvaroq](https://github.com/stellarr-studio/kelvaroq)** —
+  hardware profiling & 8 GB VRAM budget tuning (`VICTORY_TEXTURE_STAGE_MB`,
+  `VICTORY_CARD_BUFFERS_MB`, `VICTORY_QUEUE2_LANDING_MB`).
 - **[FQY55kai/ZJOU-VICTORY](https://github.com/FQY55kai/ZJOU-VICTORY)**.
-- **[myokex/victory-amd](https://github.com/myokex/victory-amd)**: the guard over
-  every view of a page (with Spexivus, joroyt and tightfall), and Joshua Odom's
-  reads into title memory.
-- **Geckomacabre** and **cxy0072019-sketch**: the texture read-back.
-- **[XCL](https://github.com/ivall/xcl)** (GPL-2.0-only) was read for how the same
-  title behaves under another layer; no code of it is here.
-- This fork's changes were made with [Claude Code](https://claude.com/claude-code).
+- **[myokex/victory-amd](https://github.com/myokex/victory-amd)** (commit `c6dc4d8`,
+  adapting PR #115 by Spexivus, joroyt, and #1122 by tightfall) and **Joshua Odom**
+  (`10ea38e`) — memory page guards and read-beside fixes.
+- **Geckomacabre** and **cxy0072019-sketch** — the texture read-back.
+- **[XCL](https://github.com/ivall/xcl)** by ivall and contributors (GPL-2.0-only) was
+  used as a reference for how the same title behaves under another layer; no code of
+  it is here.
+- **[Itsbatt](https://github.com/Itsbatt)** & **Antigravity (Google Deepmind AI)** —
+  unification, performance tuning, memory pool hardening, frame limiter, and input
+  fixes in this repository. Upstream `fxceless` changes were developed with
+  [Claude Code](https://claude.com/claude-code).
 
-## License
+## License & upstream history
 
-GPL-3.0-or-later, as VIctory. See [LICENSE](LICENSE); the one file that is not
-covered is named in [docs/asset-policy.md](docs/asset-policy.md).
+Licensed under **GPL-3.0-or-later** (see [LICENSE](LICENSE)). Full upstream changelog
+and testing history from `fxceless/victory-fork` is preserved in
+[README.upstream.md](README.upstream.md).

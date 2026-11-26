@@ -63,10 +63,11 @@ const POLL: Duration = Duration::from_millis(8);
 
 /// The keyboard's stand-in gamepad (virtual key, button); README lists it.
 /// Sticks: W/A/S/D left, I/J/K/L right; triggers Z and C.
-const FALLBACK_BUTTONS: [(u8, u32); 14] = [
+const FALLBACK_BUTTONS: [(u8, u32); 15] = [
     (0x1B, MENU), // Esc
     (0x09, VIEW), // Tab
     (0x0D, A),    // Enter
+    (0x20, A),    // Space
     (0x08, B),    // Backspace
     (b'X', X),
     (b'Y', Y),
@@ -1191,14 +1192,17 @@ mod host {
                 return None;
             }
             self.empty_until[slot] = None;
-            #[allow(unused_mut)]
             let mut pad = convert(&state.Gamepad);
-            // The scripted keys (`VICTORY_KEYS`) also press the first
-            // pad's buttons, by the stand-in pad's table: with a real pad
-            // connected the stand-in is not there, and a title that listens
-            // to the pad (the title's start screen) saw nothing.
-            #[cfg(feature = "diagnostics")]
             if slot == 0 {
+                if focused() {
+                    for &(vk, button) in &super::FALLBACK_BUTTONS {
+                        // SAFETY: plain query.
+                        if unsafe { GetAsyncKeyState(i32::from(vk)) } < 0 {
+                            pad.buttons |= button;
+                        }
+                    }
+                }
+                #[cfg(feature = "diagnostics")]
                 for vk in scripted() {
                     if let Some(&(_, button)) = super::FALLBACK_BUTTONS.iter().find(|(key, _)| *key == vk) {
                         pad.buttons |= button;
