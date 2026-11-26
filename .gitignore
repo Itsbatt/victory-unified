@@ -15,6 +15,7 @@
 /victory.toml
 
 # Places people tend to drop data into. Keep data outside the repo instead.
+/1/
 /game/
 /games/
 /assets/

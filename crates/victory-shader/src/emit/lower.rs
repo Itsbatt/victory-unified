@@ -107,6 +107,20 @@ fn counted_in_threads(parts: &Parts) -> bool {
         && !parts.p.blocks.iter().flat_map(|b| &b.insts).any(|i| i.name() == "s_barrier")
 }
 
+/// Descriptor table dword offset for the tiled PBR albedo texture (`DexNom/VIctory`).
+pub(super) const ALBEDO_DWORD: u32 = 584;
+
+std::thread_local! {
+    static TILED_AMBIENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn with_tiled_ambient<T>(on: bool, f: impl FnOnce() -> T) -> T {
+    let prev = TILED_AMBIENT.with(|c| c.replace(on));
+    let out = f();
+    TILED_AMBIENT.with(|c| c.set(prev));
+    out
+}
+
 /// [`lower`]; `counted`: the lanes past a dispatch's count of threads leave
 /// at once (`shader.rs` `USER_DISPATCH_THREADS_X`; after DexNom/VIctory
 /// bc3cd4b0, which does so for two of the programs by their digests).
@@ -323,6 +337,8 @@ struct Lower<'a> {
     flat: Option<V>,
     /// Mesh: IR blocks whose `s_barrier` is left out.
     no_barrier: HashSet<usize>,
+    /// Diffuse ambient floor for tiled PBR material shaders (`VICTORY_AMBIENT_FALLBACK=1`, `DexNom/VIctory`).
+    tiled_ambient: bool,
     /// IR blocks whose `s_barrier` not every lane is sure to reach (a lane
     /// branch lies between the entry and the block, or the program has a
     /// loop a lane can be cut out of): the barrier there keeps its fences
@@ -1440,10 +1456,22 @@ pub fn set_host_max_wave(lanes: u32) {
 thread_local! {
     /// See [`take_needs`].
     static NEEDS: std::cell::RefCell<Vec<usize>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PAIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves`].
     static LOCAL_WAVES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// See [`with_local_waves_any`].
     static LOCAL_ANY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub(super) fn with_paired<R>(f: impl FnOnce() -> R) -> R {
+    struct Reset(bool);
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PAIRED.set(self.0);
+        }
+    }
+    let _reset = Reset(PAIRED.replace(true));
+    f()
 }
 
 /// As [`with_local_waves`], with every other use of a lane mask as a number
@@ -1579,7 +1607,7 @@ pub(super) fn with_mask_ops_on_numbers<R>(translate: impl FnOnce() -> R) -> R {
     result
 }
 
-pub(super) fn host_max_wave() -> u32 {
+pub fn host_max_wave() -> u32 {
     THREAD_MAX_WAVE
         .get()
         .unwrap_or_else(|| HOST_MAX_WAVE.load(std::sync::atomic::Ordering::Relaxed))
@@ -1849,7 +1877,8 @@ impl<'a> Lower<'a> {
             // `v_readlane`, `v_writelane`, `ds_(b)permute`, masks as numbers or lane-constant
             // masks), nor when LDS may be shared within the console wave without barriers (a
             // group over 32 threads with LDS): those still need 64-lane waves.
-            if wave == 64 && host_max_wave() == 32 && (console_lanes || one_wave && s.lds_dwords > 0) {
+            console_lanes |= PAIRED.get();
+            if wave == 64 && host_max_wave() == 32 && !PAIRED.get() && (console_lanes || one_wave && s.lds_dwords > 0) {
                 let crosses = insts().any(|i| {
                     let n = i.name();
                     n.starts_with("v_mbcnt")
@@ -2119,6 +2148,7 @@ impl<'a> Lower<'a> {
             wave_base: None,
             flat: None,
             no_barrier,
+            tiled_ambient: TILED_AMBIENT.with(std::cell::Cell::get),
             fence_only,
             half_outputs: half_outputs(&x.native.io, &x.outputs),
             mask_data: match x.native.stage {
@@ -2737,6 +2767,11 @@ impl<'a> Lower<'a> {
     }
 
     fn run(mut self, counted: bool) -> Result<Lowered, Stop> {
+        let paired = PAIRED.get();
+        if paired && counted {
+            return Err(unsupported(0, "paired waves with DispatchX thread count"));
+        }
+        let mut lane_regions = Vec::new();
         let p = self.x.p;
         if counted {
             // Before anything else, so that wave counts, reads of the first
@@ -2831,7 +2866,18 @@ impl<'a> Lower<'a> {
             }
             let mut i = 0;
             while i < p.blocks[b].insts.len() {
+                let before = self.cur;
+                if paired && matches!(p.blocks[b].insts[i].fields, Fields::Ds { .. }) {
+                    // A single physical wave issues both halves of an LDS
+                    // access. Finish the preceding access before a lane
+                    // can read a word that its partner wrote.
+                    let fence = self.s.m.i32(8);
+                    self.s.op(before, "barrier", Attr::NoDuplicate, self.s.t.void, 80, &[fence]);
+                }
                 self.inst(b, i)?;
+                if paired && before != self.cur {
+                    lane_regions.push((before, self.cur));
+                }
                 if let Some(end) = self.sections.get(&b).and_then(|s| s.get(&i)).map(|s| s.end) {
                     for j in i + 1..end {
                         self.section_inst(b, j, i);
@@ -2855,6 +2901,9 @@ impl<'a> Lower<'a> {
         let root_srvs = self.s.root_srvs.iter().map(|r| r.0).collect();
         let root_uavs = self.s.root_uavs.iter().map(|r| r.0).collect();
         let cmp_samplers = self.s.cmp_samplers;
+        if paired {
+            super::bitcode::paired::run(&mut self.s, &lane_regions, &self.tail).map_err(|why| unsupported(0, why))?;
+        }
         let wave_size = self.s.wave_size;
         Ok(Lowered {
             wave_size,
@@ -4540,6 +4589,36 @@ impl<'a> Lower<'a> {
         let bz = self.s.m.cmp(c, pred::OEQ, b, zero);
         let z = self.s.m.bin(c, Bin::Or, az, bz);
         self.s.m.select(c, z, zero, m)
+    }
+
+    /// Flushes f32 subnormals to signed zero, keeping all other values and
+    /// the sign of zero intact (from victory-fork PR #1026).
+    fn ftz(&mut self, x: V) -> V {
+        let c = self.cur;
+        let bits = self.as_int(x);
+        let exp_mask = self.s.m.i32(0x7F80_0000);
+        let sign_mask = self.s.m.i32(0x8000_0000);
+        let zero = self.s.m.i32(0);
+        let exp = self.s.m.bin(c, Bin::And, bits, exp_mask);
+        let sub = self.s.m.cmp(c, pred::EQ, exp, zero);
+        let signed_zero = self.s.m.bin(c, Bin::And, bits, sign_mask);
+        let flushed = self.s.m.select(c, sub, signed_zero, bits);
+        self.as_float(flushed)
+    }
+
+    /// A legacy multiply-add as RDNA 2 runs it: fused (`v_fma_legacy_f32`),
+    /// with the legacy rule that a zero factor makes the product a +0 rather
+    /// than turning an infinite or NaN factor into a NaN (from victory-fork PR #1026).
+    fn legacy_fmad(&mut self, a: V, b: V, c: V) -> V {
+        let cur = self.cur;
+        let fused = self.fmad(a, b, c);
+        let zero = self.s.m.f32(0);
+        let az = self.s.m.cmp(cur, pred::OEQ, a, zero);
+        let bz = self.s.m.cmp(cur, pred::OEQ, b, zero);
+        let z = self.s.m.bin(cur, Bin::Or, az, bz);
+        // +0 + c, so the sign of a zero addend follows the addition.
+        let addend = self.s.m.bin(cur, Bin::Add, zero, c);
+        self.s.m.select(cur, z, addend, fused)
     }
 
     // ---- lane booleans ----
@@ -9016,21 +9095,26 @@ impl<'a> Lower<'a> {
                         let m = self.s.m.bin(c, Bin::Mul, a, bb);
                         self.s.m.bin(c, Bin::Add, m, acc)
                     }
+                    // On RDNA 2 the legacy encoding decodes as fused
+                    // (`v_fma_legacy_f32`) and flushes its sources; the
+                    // zero-factor rule of the legacy multiply comes with it.
                     _ => {
-                        let m = self.legacy_mul(a, bb);
-                        self.s.m.bin(c, Bin::Add, m, acc)
+                        let (a, bb, acc) = (self.ftz(a), self.ftz(bb), self.ftz(acc));
+                        self.legacy_fmad(a, bb, acc)
                     }
                 };
                 float(self, r)
             }
-            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" | "v_mad_legacy_f32" => {
+            "v_mad_f32" | "v_madak_f32" | "v_madmk_f32" => {
                 let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
-                let m = if name == "v_mad_legacy_f32" {
-                    self.legacy_mul(a, bb)
-                } else {
-                    self.s.m.bin(c, Bin::Mul, a, bb)
-                };
+                let m = self.s.m.bin(c, Bin::Mul, a, bb);
                 let r = self.s.m.bin(c, Bin::Add, m, cc);
+                float(self, r)
+            }
+            "v_mad_legacy_f32" => {
+                let (a, bb, cc) = (f(self, 0)?, f(self, 1)?, f(self, 2)?);
+                let (a, bb, cc) = (self.ftz(a), self.ftz(bb), self.ftz(cc));
+                let r = self.legacy_fmad(a, bb, cc);
                 float(self, r)
             }
             "v_max3_f32" | "v_min3_f32" | "v_med3_f32" => {
@@ -12774,6 +12858,29 @@ impl<'a> Lower<'a> {
         Ok(())
     }
 
+    /// Samples the tiled PBR material shader's albedo texture for ambient fallback (`DexNom/VIctory`).
+    fn ambient_albedo(&mut self) -> Option<V> {
+        let position = self.s.inputs.iter().position(|el| el.kind == 3 && el.comp == 9 && el.cols >= 2)?;
+        let (Val::I32(x), Val::I32(y)) = (self.load_input(position, 0), self.load_input(position, 1)) else {
+            return None;
+        };
+        let c = self.cur;
+        let x = self.as_float(x);
+        let y = self.as_float(y);
+        let x = self.s.m.cast(c, Cast::FpToUi, x, self.s.t.i32);
+        let y = self.s.m.cast(c, Cast::FpToUi, y, self.s.t.i32);
+        let table = self.host_word(RootType::Table, 0, 0);
+        let offset = self.s.m.i32(4 * ALBEDO_DWORD);
+        let address = self.s.m.bin(c, Bin::Add, table, offset);
+        let shift = self.s.m.i32(5);
+        let index = self.s.m.bin(c, Bin::LShr, address, shift);
+        let view = self.s.heap_handle(c, index, false, false, (2, 0x409));
+        let zero = self.s.m.i32(0);
+        let undef = self.s.m.undef(self.s.t.i32);
+        let ty = self.s.t.res_ret;
+        Some(self.s.op(c, "textureLoad.f32", Attr::ReadOnly, ty, 66, &[view, zero, x, y, undef, undef, undef, undef]))
+    }
+
     fn export(&mut self, b: usize, i: usize) -> Result<(), Why> {
         let e = *self
             .exports
@@ -12959,6 +13066,11 @@ impl<'a> Lower<'a> {
             (true, false) => ("storeVertexOutput", 171),
             (true, true) => ("storePrimitiveOutput", 172),
         };
+        let ambient = if self.tiled_ambient && e.target == Target::Color(0) {
+            self.ambient_albedo()
+        } else {
+            None
+        };
         for (id, col, value, half) in stores {
             let mut x = self.i32_of(value)?;
             if let Some(high) = half {
@@ -12976,7 +13088,7 @@ impl<'a> Lower<'a> {
             }
             let el = &mut elements(self, primitive)[id];
             el.usage |= 1 << col;
-            let (suffix, x) = match el.comp {
+            let (suffix, mut x) = match el.comp {
                 9 if half.is_some() => (".f32", self.as_float(x)),
                 9 => {
                     let f = match self.floats.get(&value) {
@@ -12987,6 +13099,13 @@ impl<'a> Lower<'a> {
                 }
                 _ => (".i32", x),
             };
+            if let Some(rgb) = ambient.filter(|_| col < 3 && suffix == ".f32") {
+                let c = self.cur;
+                let base = self.s.m.extract(c, rgb, u32::from(col));
+                let level = self.s.m.f32(0.24f32.to_bits());
+                let fill = self.s.m.bin(c, Bin::Mul, base, level);
+                x = self.s.op(c, "binary.f32", Attr::ReadNone, self.s.t.f32, 35, &[x, fill]);
+            }
             let mut args = vec![
                 self.s.m.i32(id as u32),
                 self.s.m.i32(0),

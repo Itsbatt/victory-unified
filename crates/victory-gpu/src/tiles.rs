@@ -71,6 +71,23 @@ const HEAP_TILES: u32 = 1024;
 /// no heap could be had); uploads recorded again for such a level.
 pub(crate) static STATS: [AtomicU64; 11] = [const { AtomicU64::new(0) }; 11];
 
+/// `VICTORY_TILES_SMALL_WHEN_FULL_MB` (default `512` on <=8 GiB VRAM adapters,
+/// `0` otherwise; `0` disables): while the card has no room, an upload still
+/// gives tiles to the smallest held levels of its texture so textures never
+/// disappear or turn black on 8 GB GPUs (from `victory-fork` `f6a09d3`).
+fn small_when_full_mb() -> u64 {
+    static MB: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MB.get_or_init(|| {
+        std::env::var("VICTORY_TILES_SMALL_WHEN_FULL_MB")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(512, |mb| mb.min(1024))
+    })
+}
+
+/// Tiles a texture gets at most on a full card ([`small_when_full_mb`]): 1 MiB.
+const SMALL_TILES: u32 = 16;
+
 /// Whether textures are made this way: the switch
 /// (`VICTORY_LEVELS_ON_DEMAND=1`; off by default), and a card that reads
 /// zeros from, and drops writes to, levels without memory (tiled resources
@@ -378,7 +395,10 @@ impl Tiled {
         let named = held | card;
         // The levels the card itself writes are few and are not kept
         // waiting: a write of the card's into no memory is lost.
-        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card });
+        // On a full card, with `VICTORY_TILES_SMALL_WHEN_FULL_MB`, the
+        // smallest held levels too: this list writes every level whole.
+        let small = if room { 0 } else { self.small_levels(held) };
+        let changed = self.give_locked(&mut given, queue, device, texture, named, if room { named } else { card | small });
         let missing = self.without_locked(&given, named) != 0;
         (changed, missing)
     }
@@ -428,6 +448,35 @@ impl Tiled {
             self.unclaim(without);
         }
         changed
+    }
+
+    /// Of the levels `held`, the smallest ones that may get tiles on a full card
+    /// ([`small_when_full_mb`]) so textures remain visible instead of disappearing.
+    fn small_levels(&self, held: u32) -> u32 {
+        let cap = small_when_full_mb() << 20;
+        if cap == 0 || STATS[2].load(Ordering::Relaxed) >= cap {
+            return 0;
+        }
+        let first_packed = self.standard.len() as u32;
+        let mut bits = 0u32;
+        let mut tiles = 0u32;
+        if self.packed > 0 {
+            let packed_bits = self.every_level() & !((1u32 << first_packed) - 1);
+            if held & packed_bits == 0 {
+                return 0;
+            }
+            bits |= packed_bits;
+            tiles += self.packed;
+        }
+        for level in (0..first_packed).rev() {
+            let tiles_here = self.standard[level as usize];
+            if held & (1 << level) == 0 || tiles + tiles_here > SMALL_TILES {
+                break;
+            }
+            tiles += tiles_here;
+            bits |= 1 << level;
+        }
+        if tiles > SMALL_TILES { 0 } else { bits }
     }
 
     /// The bits of the levels that get their tiles with level `level`:

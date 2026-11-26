@@ -118,7 +118,7 @@ use crate::{ShaderError, io, ir, resource, structure};
 
 pub use bitcode::census;
 pub use sampler::StaticSampler;
-pub use lower::{host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
+pub use lower::{host_max_wave, host_settings, set_host_max_wave, set_host_rdna, set_thread_max_wave};
 pub use rect::rect_list_gs;
 pub use shader::{
     MEMORY_FAULTS, MEMORY_PAGES, MEMORY_READ_ONLY, ROOT_CBV_SPACE, SAMPLER_SPACE, SLOT_FAULTS, SLOT_MEMORY, SLOT_STRIDES,
@@ -460,6 +460,26 @@ pub fn emit_with_retries(
     }
 }
 
+/// Diffuse ambient floor in tiled PBR material shaders (`VICTORY_AMBIENT_FALLBACK=1`, from `DexNom/VIctory`).
+pub fn ambient_fallback_enabled() -> bool {
+    std::env::var_os("VICTORY_AMBIENT_FALLBACK").is_some_and(|v| v == "1")
+}
+
+fn tiled_ambient(c: &Container, native: &NativeProgram) -> bool {
+    native.stage == HwStage::Ps
+        && ambient_fallback_enabled()
+        && c.part(FourCC::PSV0).is_some_and(|psv| {
+            psv.data.split(|&b| b == 0).any(|entry| {
+                entry.starts_with(b"TL_PS_PBR_MATERIAL_")
+                    || entry.starts_with(b"TL_PS_NoDir_PBR_MATERIAL_")
+            })
+        })
+        && native.used.iter().any(|u| {
+            u.root == RootType::Table && u.kind == crate::ResourceType::Srv
+                && u.slot == 0 && u.table_offset_dwords == lower::ALBEDO_DWORD && u.dwords == 8
+        })
+}
+
 /// Emits a program whose earlier stages already ran.
 pub fn emit(
     c: &Container,
@@ -468,6 +488,18 @@ pub fn emit(
     st: &structure::Structured,
     io: &io::Io,
     res: &resource::Resources,
+) -> Result<HostShader, ShaderError> {
+    emit_with_paired(c, native, p, st, io, res, paired_compute_enabled())
+}
+
+fn emit_with_paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+    io: &io::Io,
+    res: &resource::Resources,
+    allow_paired: bool,
 ) -> Result<HostShader, ShaderError> {
     // (what an earlier program's lowering on this thread left behind)
     lower::take_needs();
@@ -642,6 +674,23 @@ pub fn emit(
         }
         other => other,
     };
+    let needs_pair = matches!(original, Ok((_, Some(64))))
+        || matches!(&original, Err(ShaderError::Unsupported { what, .. })
+            if lower::needs_every_lane(what) || *what == "a lane permute across two host waves");
+    if needs_pair
+        && lower::host_max_wave() == 32
+        && native.stage == HwStage::Cs
+        && native.wave64
+        && allow_paired
+    {
+        match emit_paired(c, native, p, st) {
+            Ok((shader, Some(32))) => return Ok(shader),
+            Err(e) if std::env::var_os("VICTORY_WAVE_WHY").is_some() => {
+                eprintln!("paired wave64 compute unavailable: {e}");
+            }
+            _ => {}
+        }
+    }
     let original = original.map(|(shader, _)| shader);
     // Retry unsupported programs only. Threading can separate an unknown
     // register value from its apparent use on a mutually exclusive path.
@@ -657,6 +706,46 @@ pub fn emit(
     let io = io::raise(&p, native)?;
     let res = resource::track(&p, &native.layout, native.stage, Some(&st))?;
     emit_program(c, native, &p, &st, &io, &res).map(|(shader, _)| shader)
+}
+
+/// Seven+ translated compute pipelines requested a wave wider than the
+/// adapter could run. When `VICTORY_WAVE64_PAIRED=1`, retry storing two
+/// guest lanes in each physical lane.
+pub fn paired_compute_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("VICTORY_WAVE64_PAIRED").is_some_and(|v| v == "1"))
+}
+
+/// Whether `dxil` pins its wave size to 64 (`PSV0` min/max == 64), which fails
+/// pipeline creation on 32-lane devices (`0x80070057`).
+pub fn is_wave64_dxil(dxil: &[u8]) -> bool {
+    let Ok(c) = Container::parse(dxil) else { return false };
+    let Some(psv) = c.part(FourCC::PSV0) else { return false };
+    psv.data.len() >= 28
+        && crate::dxbc::u32_at(psv.data, 0).is_ok_and(|sz| sz >= 24)
+        && crate::dxbc::u32_at(psv.data, 20) == Ok(64)
+        && crate::dxbc::u32_at(psv.data, 24) == Ok(64)
+}
+
+fn emit_paired(
+    c: &Container,
+    native: &NativeProgram,
+    p: &ir::Program,
+    st: &structure::Structured,
+) -> Result<(HostShader, Option<u32>), ShaderError> {
+    let wide = st.wave_any.iter().enumerate().filter_map(|(b, kind)| kind.map(|_| b)).collect();
+    let st = structure::structure_wide(p, &wide)?;
+    for (b, exit) in st.exits.iter().enumerate() {
+        if let structure::LaneExit::Branch { when, .. } = *exit
+            && !wide.contains(&b)
+            && st.bools.support(when).iter().any(|a| !matches!(a, structure::Atom::Uniform(_)))
+        {
+            return Err(ShaderError::Unsupported { offset: 0, what: "a branch without a whole-wave decision" });
+        }
+    }
+    let io = io::raise(p, native)?;
+    let res = resource::track(p, &native.layout, native.stage, Some(&st))?;
+    lower::with_paired(|| emit_program(c, native, p, &st, &io, &res))
 }
 
 /// `p` (a console wave64 compute program on a host of 32-lane waves) with the per-lane
@@ -794,16 +883,18 @@ fn emit_program(
         }
         _ => 0,
     };
-    let l = lower::lower(&lower::Parts {
-        native,
-        p,
-        st,
-        io,
-        res,
-        inputs,
-        outputs,
-        prims,
-        mesh_stride,
+    let l = lower::with_tiled_ambient(tiled_ambient(c, native), || {
+        lower::lower(&lower::Parts {
+            native,
+            p,
+            st,
+            io,
+            res,
+            inputs,
+            outputs,
+            prims,
+            mesh_stride,
+        })
     })?;
     let wave_size = l.wave_size;
     let shader = HostShader {

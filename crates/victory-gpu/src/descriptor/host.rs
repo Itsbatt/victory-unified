@@ -1867,36 +1867,49 @@ impl HostHeap {
         let started = std::time::Instant::now();
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicAsked, 1);
-        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
-        let (next, taken) = &mut *guard;
         let enough = self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
             && n < self.too_long.load(std::sync::atomic::Ordering::Relaxed);
-        let n = n as usize;
-        // Search from `next` on, then from the start (extending past cursor by
-        // n - 1 so contiguous runs crossing the cursor are not missed).
+        if !enough {
+            #[cfg(feature = "diagnostics")]
+            {
+                use crate::copystat::{C, add};
+                add(C::DynamicRefused, 1);
+                add(C::DynamicNs, started.elapsed().as_nanos() as u64);
+            }
+            return None;
+        }
+        let mut guard = self.next.lock().unwrap_or_else(|e| e.into_inner());
+        let (next, taken) = &mut *guard;
+        let n_usize = n as usize;
         let cursor = *next as usize;
         let end = self.dynamic as usize;
-        let second_end = cursor.saturating_add(n.saturating_sub(1)).min(end);
-        let starts = (cursor..end).chain(0..second_end);
-        let mut run = 0;
-        let mut found = None;
-        let mut last = usize::MAX;
-        for at in starts.take(if enough { usize::MAX } else { 0 }) {
-            // A run cannot wrap past the end.
-            if at != last.wrapping_add(1) {
-                run = 0;
+        // Fast Boyer-Moore + SIMD-vectorizable scan over `taken`: checks from
+        // `cursor..end`, then `0..min(cursor + n - 1, end)`.
+        fn find_run(taken: &[bool], start: usize, end: usize, n: usize) -> Option<usize> {
+            let mut i = start;
+            while i + n <= end {
+                if taken[i] {
+                    if i >= end - n {
+                        return None;
+                    }
+                    match taken[i + 1..=end - n].iter().position(|&t| !t) {
+                        Some(off) => i += 1 + off,
+                        None => return None,
+                    }
+                    continue;
+                }
+                match taken[i..i + n].iter().rposition(|&t| t) {
+                    Some(hit) => i += hit + 1,
+                    None => return Some(i),
+                }
             }
-            last = at;
-            run = if taken[at] { 0 } else { run + 1 };
-            if run == n {
-                found = Some(at + 1 - n);
-                break;
-            }
+            None
         }
+        let second_end = cursor.saturating_add(n_usize.saturating_sub(1)).min(end);
+        let found = find_run(taken, cursor, end, n_usize)
+            .or_else(|| find_run(taken, 0, second_end, n_usize));
         let Some(first) = found else {
-            if enough {
-                self.too_long.fetch_min(n as u32, std::sync::atomic::Ordering::Relaxed);
-            }
+            self.too_long.fetch_min(n, std::sync::atomic::Ordering::Relaxed);
             static ONCE: std::sync::Once = std::sync::Once::new();
             ONCE.call_once(|| tracing::warn!(n, "no free dynamic descriptor slots: a table is not made"));
             #[cfg(feature = "diagnostics")]
@@ -1909,9 +1922,9 @@ impl HostHeap {
         };
         #[cfg(feature = "diagnostics")]
         crate::copystat::add(crate::copystat::C::DynamicNs, started.elapsed().as_nanos() as u64);
-        taken[first..first + n].fill(true);
-        self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
-        *next = ((first + n) % end) as u32;
+        taken[first..first + n_usize].fill(true);
+        self.free.fetch_sub(n, std::sync::atomic::Ordering::Relaxed);
+        *next = ((first + n_usize) % end) as u32;
         Some(self.count + first as u32)
     }
 

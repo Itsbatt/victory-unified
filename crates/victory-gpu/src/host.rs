@@ -2725,9 +2725,17 @@ mod relay_tests {
 /// all at once ran the slots out before (run 45).
 fn late_most() -> usize {
     static MOST: OnceLock<usize> = OnceLock::new();
-    *MOST.get_or_init(|| {
+    let most = *MOST.get_or_init(|| {
         std::env::var("VICTORY_LATE_WAIT_LISTS").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256).max(1)
-    })
+    });
+    if settle_room() { most * 2 } else { most }
+}
+
+/// Whether flights get twice the room before "lists in the air" settles them
+/// (`VICTORY_SETTLE_ROOM=1`, ported from `victory-fork` `06702fe`).
+fn settle_room() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_SETTLE_ROOM").is_some_and(|v| v == "1"))
 }
 
 /// Whether a submission with bottom-of-pipe writes may fly
@@ -3203,6 +3211,9 @@ fn stale_under_flights(runs: &[&HostList]) -> Vec<(std::sync::Arc<crate::shadow:
         // title's ring of constants come here too, which were waited for
         // before: hundreds of short runs each, at about 1.5 us a run.
         let mut runs_left = if card_steps::stage() > 0 { 4096 } else { 512 };
+        if settle_room() {
+            runs_left = (runs_left * 8).min(1 << 16);
+        }
         UNDER_SCAN.fetch_add(scanning.elapsed().as_nanos() as u64, Ordering::Relaxed);
         spans.retain(|(shadow, from, to)| shadow.merge_under_writes(*from, *to - *from, &mut runs_left));
         return spans;
@@ -3811,6 +3822,14 @@ fn late_line(frames: f64) {
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
     crate::picked::log(frames);
+    {
+        let found = [0, 1].map(|i| crate::shadow::LOOKUPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+        tracing::info!(
+            "asks for a buffer's host copy per frame: {:.0} answered from the asking thread's memory of them, {:.0} from the tables (VICTORY_LOOKUP_CACHE / VICTORY_QUICK_FIND)",
+            found[0],
+            found[1]
+        );
+    }
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
     if late_exact() {

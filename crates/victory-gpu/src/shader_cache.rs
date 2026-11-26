@@ -123,6 +123,7 @@ fn build() -> [u8; 32] {
             "VICTORY_MESH_OUTPUT_STRICT",
             "VICTORY_BVH_FENCES",
             "VICTORY_BVH_BOUNDS",
+            "VICTORY_AMBIENT_FALLBACK",
         ] {
             bytes.extend_from_slice(name.as_bytes());
             bytes.push(b'=');
@@ -238,18 +239,23 @@ fn cached_by(
             .map_err(|e| format!("{e:#}"))?;
         if let Some((shader, made_by)) = std::fs::read(&path).ok().and_then(|b| decode(&b)) {
             let ran = converter.ran.load(Ordering::Relaxed);
-            if !ran && made_by != source.as_bytes() {
-                STALE.fetch_add(1, Ordering::Relaxed);
-                if refresh && old.is_none() {
+            let refresh_paired = victory_shader::emit::paired_compute_enabled()
+                && victory_shader::emit::host_max_wave() == 32
+                && victory_shader::emit::is_wave64_dxil(&shader.dxil);
+            if !ran && (made_by != source.as_bytes() || refresh_paired) {
+                if made_by != source.as_bytes() {
+                    STALE.fetch_add(1, Ordering::Relaxed);
+                }
+                if (refresh || refresh_paired) && old.is_none() {
                     // Translated again in its place; what came out before
                     // is what the new one is compared with.
-                    tracing::debug!(path = %path.display(), "shader cache entry of an earlier translator; translating again");
+                    tracing::debug!(path = %path.display(), refresh_paired, "shader cache entry refreshed");
                     old = Some(shader);
                     let _ = std::fs::remove_file(&path);
                     continue;
                 }
                 static SAID: AtomicBool = AtomicBool::new(false);
-                if !SAID.swap(true, Ordering::Relaxed) {
+                if made_by != source.as_bytes() && !SAID.swap(true, Ordering::Relaxed) {
                     tracing::info!("shader translations of an earlier build of the translator (same version) are served; `victory shaders` translates them again");
                 }
             }
