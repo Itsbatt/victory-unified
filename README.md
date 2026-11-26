@@ -137,28 +137,103 @@ stable window from ~49 minutes to ~58 minutes and removed the crash in those run
   (`victory warm` makes them ahead).
 - Recording a frame in the world makes the title's own watchdog end it.
 
-## Quick play
+## How to run it
+
+This is a layer that runs your **own** copy of the title natively on Windows. It
+ships **no game files**: you supply the dump. Nothing here is affiliated with or
+endorsed by the game's developer or publisher.
+
+### 1. Prerequisites
+
+- Windows 10/11 x64.
+- A CPU with **AVX2**.
+- A **Direct3D 12** GPU with **shader model 6.6** and **mesh shaders** (RTX 3070 8 GB
+  is the reference tuning target; RX 7900 XTX is the primary dev card).
+- **Rust** (the toolchain is pinned in `rust-toolchain.toml`; `rustup` will fetch it)
+  and the **MSVC build tools** (C++ build tools + Windows SDK).
+- Your own dump of the title, in a folder **outside this repository** (the tools
+  refuse paths inside the repo).
+- About **64 GB RAM recommended** on the 7900 XTX; the RTX 3070 8 GB build needs a
+  large Windows commit (pagefile) — 2–4 GB caused OOM in `shadow::pooled`.
+
+### 2. Configure your paths
+
+Copy the example config and point it at your files (paths must be outside the repo):
+
+```powershell
+copy victory.example.toml victory.toml
+```
+
+Edit `victory.toml`:
+
+```toml
+[paths]
+game_dir = 'D:\games\gta6-dump'      # your own dump; env: VICTORY_GAME_DIR
+# cache_dir = 'D:\victory-data\cache' # default: %LOCALAPPDATA%\victory\cache
+# data_dir  = 'D:\victory-data\data'  # default: %LOCALAPPDATA%\victory\data
+```
+
+`victory.toml` is git-ignored. Environment variables (`VICTORY_GAME_DIR`,
+`VICTORY_CACHE_DIR`, `VICTORY_DATA_DIR`, `VICTORY_CONFIG`) take precedence over it.
+
+### 3. Build
+
+The launcher defaults to the `diag` build (`target\diag\victory.exe`), which is what
+all measurements are taken from:
+
+```powershell
+cargo build --profile diag -p victory --features diagnostics
+```
+
+For a plain release build instead (then pass `-Build release` to the launcher):
 
 ```powershell
 cargo build --release -p victory
-powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Game "<your game folder>\<the game's exe>"
 ```
 
-You need Windows 10/11 x64, a CPU with AVX2, a Direct3D 12 GPU with shader model 6.6
-and mesh shaders, Rust (the toolchain is pinned), the MSVC build tools, and your own
-dump of the title. `scripts\play.ps1 -Safe` leaves out the newest, faster ways; try it
-first when something is wrong. `-RayTracing` turns the title's ray-traced indirect
-light on.
+### 4. (Recommended) pre-translate shaders and pipelines
 
-Before the first run, ahead of time (both can be stopped and resumed later):
+Both can be stopped and resumed later. Do this once per new build / driver:
 
 ```powershell
-target\diag\victory.exe shaders <the shader archives>   # every shader translated, minutes
+target\diag\victory.exe shaders <the shader archives>   # every shader translated, takes minutes
 target\diag\victory.exe warm --used                     # pipelines earlier runs drew with
 ```
 
+### 5. Run
+
+Run from a **normal window, not as administrator** (so the driver keeps its shader
+cache elsewhere):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\play.ps1 -Exe "<path>\to\your\game_scarlett_master.exe"
+```
+
+`play.ps1` options:
+
+| Option | Effect |
+|---|---|
+| `-Exe <path>` | **Required.** Path to your own copy's executable. |
+| `-Safe` | Leave out the newest, faster ways. **Try this first when something is wrong.** |
+| `-RayTracing` | Turn on the title's ray-traced indirect light (lit interiors, ~1/3 slower). |
+| `-Build diag\|release` | Which build to launch (default `diag`). |
+| `-More @{VICTORY_X='1'}` | Pass extra `VICTORY_*` settings explicitly, e.g. `-More @{VICTORY_PANEL='1'}`. |
+
+The RTX 3070 8 GB tuning lives in `Play-GTA6-RTX3070.ps1` (same idea, 1080p +
+`VICTORY_QUEUE2` + 2560 MB texture budget). `play.ps1` launches the **Series X**
+profile (what the reference machine used). To use the **Series S** profile, call the
+binary directly with the console flag:
+
+```powershell
+target\diag\victory.exe run "<path>\to\game_scarlett_master.exe" --execute --console series-s
+```
+
+### 6. Every switch
+
 Every `VICTORY_...` switch is described in a comment where it is read; upstream's own
-description is in [docs/README-fxceless.md](docs/README-fxceless.md).
+description is in [docs/README-fxceless.md](docs/README-fxceless.md). The unified
+build's switches and attributions are listed in
+[UNIFIED_CHANGELOG.md](UNIFIED_CHANGELOG.md).
 
 ## Credits
 
